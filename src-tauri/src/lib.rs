@@ -289,6 +289,72 @@ fn build_user_turns(path: &Path) -> Vec<UserTurn> {
     v
 }
 
+/// transcript 1패스로 user 턴 목록과 uuid→응답 맵을 동시에 만든다.
+///
+/// 프롬프트 하나씩 처리하면 같은 세션 파일을 프롬프트 수만큼 다시 읽게 된다.
+/// 전체 재추출처럼 한 세션의 프롬프트를 몰아서 처리할 때는 이 인덱스를 한 번만 만들어 쓴다.
+struct SessionIndex {
+    turns: Vec<UserTurn>,
+    responses: std::collections::HashMap<String, String>,
+}
+
+fn build_session_index(path: &Path) -> SessionIndex {
+    let mut turns = Vec::new();
+    let mut responses = std::collections::HashMap::new();
+    let Ok(file) = File::open(path) else {
+        return SessionIndex { turns, responses };
+    };
+
+    // 현재 수집 중인 프롬프트의 uuid 와, 거기에 쌓고 있는 응답.
+    let mut current: Option<String> = None;
+    let mut out = String::new();
+
+    for line in BufReader::new(file).lines() {
+        let Ok(line) = line else { continue };
+        let Ok(j) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        let t = j.get("type").and_then(|v| v.as_str()).unwrap_or("");
+
+        if t == "user" {
+            // 실제 프롬프트를 만나면 직전 프롬프트의 수집을 마감하고 새로 시작한다.
+            // tool_result·주입(isMeta) 이벤트는 user 타입이어도 프롬프트가 아니므로 통과.
+            if let Some(text) = user_typed_text(&j) {
+                if let Some(u) = current.take() {
+                    responses.insert(u, std::mem::take(&mut out));
+                }
+                let uuid = j
+                    .get("uuid")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                if uuid.is_empty() {
+                    continue;
+                }
+                let epoch = j
+                    .get("timestamp")
+                    .and_then(|v| v.as_str())
+                    .and_then(parse_iso_to_epoch)
+                    .unwrap_or(0);
+                turns.push(UserTurn {
+                    uuid: uuid.clone(),
+                    epoch,
+                    text,
+                });
+                current = Some(uuid);
+                out.clear();
+            }
+        } else if t == "assistant" && current.is_some() {
+            append_assistant_blocks(&j, &mut out);
+        }
+    }
+    if let Some(u) = current.take() {
+        responses.insert(u, out);
+    }
+
+    SessionIndex { turns, responses }
+}
+
 /// created_at(로컬)·prompt_text 로 transcript user 이벤트의 uuid 를 찾는다.
 /// 1차: 시간창 ±30s, 2차: 텍스트 접두 일치로 동률 보정, 최근접 시각 선택.
 fn resolve_uuid(
@@ -773,6 +839,109 @@ fn fetch_recent_responses() -> Result<BatchFetchResult, String> {
     })
 }
 
+/// 저장된 응답을 전부 버리고 현재 매칭 로직으로 다시 추출한다.
+///
+/// 왜 필요한가: get_response 는 prompts.response 에 값이 있으면 그대로 돌려주고
+/// transcript 를 다시 읽지 않는다. 추출 로직이 바뀐 버전으로 올라오면, 비어 있던 응답은
+/// 자동으로 새로 채워지지만 예전 로직이 "잘못 채워 넣은" 응답은 영원히 그대로 남는다.
+/// 업그레이드 후 한 번 돌려 과거 기록까지 새 로직으로 맞추는 용도.
+///
+/// 세션 파일을 프롬프트마다 다시 읽지 않고 세션당 한 번만 인덱싱한다.
+#[tauri::command]
+fn refetch_all_responses() -> Result<BatchFetchResult, String> {
+    let conn = open_conn()?;
+    let offset = local_offset_seconds(&conn);
+
+    // (cwd, session_id) 로 묶어, 같은 transcript 를 쓰는 프롬프트를 한 번에 처리한다.
+    struct Row {
+        id: i64,
+        prompt: String,
+        created_at: String,
+        msg_uuid: Option<String>,
+    }
+    let mut by_session: std::collections::BTreeMap<(String, String), Vec<Row>> =
+        std::collections::BTreeMap::new();
+    let mut total: i64 = 0;
+
+    {
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, session_id, cwd, prompt, created_at, msg_uuid
+                 FROM prompts
+                 WHERE session_id IS NOT NULL AND cwd IS NOT NULL
+                 ORDER BY id",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, Option<String>>(5)?,
+                ))
+            })
+            .map_err(|e| e.to_string())?;
+        for row in rows {
+            let (id, session_id, cwd, prompt, created_at, msg_uuid) =
+                row.map_err(|e| e.to_string())?;
+            total += 1;
+            by_session.entry((cwd, session_id)).or_default().push(Row {
+                id,
+                prompt,
+                created_at,
+                msg_uuid,
+            });
+        }
+    }
+
+    let mut fetched = 0;
+    let mut not_found = 0;
+    let mut failed = 0;
+
+    for ((cwd, session_id), rows) in by_session {
+        let Some(path) = find_jsonl(&cwd, &session_id) else {
+            // transcript 가 사라진 세션. 저장된 응답은 손대지 않는다.
+            failed += rows.len() as i64;
+            continue;
+        };
+        let idx = build_session_index(&path);
+
+        for row in rows {
+            // 캐시된 uuid 가 있으면 그대로, 없으면 시각·텍스트로 해석한다.
+            let uuid = row
+                .msg_uuid
+                .filter(|u| !u.is_empty())
+                .or_else(|| resolve_uuid(&idx.turns, &row.created_at, &row.prompt, offset));
+
+            let Some(uuid) = uuid else {
+                not_found += 1;
+                continue;
+            };
+            let Some(resp) = idx.responses.get(&uuid).filter(|s| !s.trim().is_empty()) else {
+                not_found += 1;
+                continue;
+            };
+
+            conn.execute(
+                "UPDATE prompts SET response = ?1, msg_uuid = ?2 WHERE id = ?3",
+                params![resp, uuid, row.id],
+            )
+            .map_err(|e| e.to_string())?;
+            fetched += 1;
+        }
+    }
+
+    Ok(BatchFetchResult {
+        total,
+        fetched,
+        not_found,
+        failed,
+    })
+}
+
 #[tauri::command]
 fn save_response(prompt_id: i64, response: String) -> Result<(), String> {
     let conn = open_conn()?;
@@ -1085,6 +1254,7 @@ pub fn run() {
             set_cwd_alias,
             get_response,
             fetch_recent_responses,
+            refetch_all_responses,
             save_response,
             update_prompt,
             delete_prompt,
