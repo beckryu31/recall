@@ -161,7 +161,7 @@ To undo a cleanup, copy the snapshot back over `~/.claude/prompts.db`.
 - **A prompt with no response is usually correct, not a bug.** If you cancelled a turn with ESC before Claude answered, there is genuinely no response to show. Recall no longer confuses this with a failed lookup.
 - **Response lookup can still miss.** The transcript event is resolved by timestamp and text prefix, so a deleted or truncated `.jsonl` leaves the prompt without a response. The prompt itself still shows.
 - **Responses are summarized, not replayed.** Text blocks are kept verbatim; tool calls are collapsed to a `[tool: Read]` marker. Recall shows you what Claude *said*, not everything it *did*.
-- **Slash commands never reach the database.** The `UserPromptSubmit` hook receives no prompt text for `/some-command`, so no row is written. They exist in the transcripts but not in Recall.
+- **Built-in commands never reach the database — your own skills do.** `/clear`, `/compact` and the other built-ins are handled by the Claude Code client itself and are never submitted as prompts, so the hook never fires and no row is written. Custom skills and slash commands (`/my-skill`) *are* real prompts, and Recall records them like any other.
 - **Only prompts logged after the hook is installed appear.** There's no backfill from existing transcripts.
 - **Sessions are grouped by their first working directory.** If you `cd` mid-session, every prompt in that session is still filed under where it started.
 - macOS is the only platform this has been used on. Tauri should build on Linux and Windows, but neither is tested.
