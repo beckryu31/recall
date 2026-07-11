@@ -39,6 +39,25 @@ type BatchFetchResult = {
   failed: number;
 };
 
+type PurgeCandidate = {
+  id: number;
+  prompt: string;
+  created_at: string;
+  cwd: string | null;
+};
+
+type PurgeScan = {
+  scanned: number;
+  recovered: number;
+  protected: number;
+  candidates: PurgeCandidate[];
+};
+
+type DeleteResult = {
+  deleted: number;
+  backup_path: string;
+};
+
 const sourceLabel = (s: PromptResponse["source"]) => {
   if (s === "saved") return "저장됨";
   if (s === "cache") return "캐시됨";
@@ -84,6 +103,10 @@ export default function App() {
   const [responseEditing, setResponseEditing] = useState(false);
   const [batchLoading, setBatchLoading] = useState(false);
   const [confirmingDelete, setConfirmingDelete] = useState(false);
+  const [purgeScanning, setPurgeScanning] = useState(false);
+  const [purgeScan, setPurgeScan] = useState<PurgeScan | null>(null);
+  const [purgeDeleting, setPurgeDeleting] = useState(false);
+  const [lastBackup, setLastBackup] = useState("");
 
   const loadCwds = async () => {
     try {
@@ -124,6 +147,44 @@ export default function App() {
       setError(String(e));
     } finally {
       setBatchLoading(false);
+    }
+  };
+
+  // 1단계: 응답이 없는 프롬프트를 훑어 JSONL 에서 되살릴 수 있는 것은 되살리고,
+  // 끝내 응답을 찾지 못한 것만 삭제 후보로 받아온다. 이 단계에서는 아무것도 지우지 않는다.
+  const scanUnanswered = async () => {
+    if (purgeScanning) return;
+    setPurgeScanning(true);
+    try {
+      const scan = await invoke<PurgeScan>("scan_unanswered_prompts");
+      setPurgeScan(scan);
+      if (scan.recovered > 0) {
+        await loadPrompts();
+        if (selected) await loadResponse(selected.id);
+      }
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setPurgeScanning(false);
+    }
+  };
+
+  // 2단계: 화면에서 확인한 후보만 실제로 삭제한다.
+  const purgeCandidates = async () => {
+    if (!purgeScan || purgeDeleting) return;
+    const ids = purgeScan.candidates.map((c) => c.id);
+    setPurgeDeleting(true);
+    try {
+      const r = await invoke<DeleteResult>("delete_prompts", { ids });
+      setPurgeScan(null);
+      if (selected && ids.includes(selected.id)) setSelected(null);
+      await Promise.all([loadCwds(), loadTags(), loadPrompts()]);
+      setLastBackup(r.backup_path);
+      showToast(`${r.deleted}개 삭제됨 · 백업 저장됨`);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setPurgeDeleting(false);
     }
   };
 
@@ -677,6 +738,23 @@ export default function App() {
           >
             {batchLoading ? "가져오는 중…" : "⤓ 24h"}
           </button>
+          <button
+            onClick={scanUnanswered}
+            disabled={purgeScanning}
+            title="응답을 되살릴 수 없는 프롬프트를 찾아 한꺼번에 정리"
+            style={{
+              padding: "8px 10px",
+              border: "1px solid #ddd",
+              borderRadius: 6,
+              background: purgeScanning ? "#eef" : "#fff",
+              cursor: purgeScanning ? "default" : "pointer",
+              fontSize: 12,
+              whiteSpace: "nowrap",
+              color: purgeScanning ? "#888" : "#a33",
+            }}
+          >
+            {purgeScanning ? "검사 중…" : "🧹 정리"}
+          </button>
         </div>
         <div
           style={{
@@ -1218,6 +1296,194 @@ export default function App() {
           </div>
         )}
       </main>
+
+      {lastBackup && (
+        <div
+          style={{
+            position: "fixed",
+            bottom: 28,
+            left: 28,
+            maxWidth: 460,
+            background: "#f2faf5",
+            border: "1px solid #cfe8d8",
+            borderRadius: 8,
+            padding: "10px 12px",
+            fontSize: 12,
+            color: "#2a6",
+            display: "flex",
+            gap: 10,
+            alignItems: "center",
+            zIndex: 90,
+          }}
+        >
+          <div style={{ flex: 1, wordBreak: "break-all" }}>
+            삭제 전 백업이 저장되었습니다
+            <div style={{ color: "#555", marginTop: 2 }}>{lastBackup}</div>
+          </div>
+          <button
+            onClick={async () => {
+              await writeText(lastBackup);
+              showToast("경로 복사됨");
+            }}
+            style={{ fontSize: 11, padding: "4px 8px" }}
+          >
+            경로 복사
+          </button>
+          <button
+            onClick={() => setLastBackup("")}
+            style={{ fontSize: 11, padding: "4px 8px" }}
+          >
+            닫기
+          </button>
+        </div>
+      )}
+
+      {purgeScan && (
+        <div
+          onClick={() => !purgeDeleting && setPurgeScan(null)}
+          style={{
+            position: "fixed",
+            inset: 0,
+            background: "rgba(0,0,0,0.35)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            zIndex: 100,
+          }}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            style={{
+              width: 560,
+              maxHeight: "76vh",
+              background: "#fff",
+              borderRadius: 10,
+              padding: 20,
+              display: "flex",
+              flexDirection: "column",
+              gap: 12,
+              boxShadow: "0 12px 40px rgba(0,0,0,0.25)",
+            }}
+          >
+            <div style={{ fontSize: 15, fontWeight: 600 }}>
+              응답 없는 프롬프트 정리
+            </div>
+
+            <div style={{ fontSize: 13, color: "#555", lineHeight: 1.7 }}>
+              응답이 비어 있던 <b>{purgeScan.scanned}개</b>를 검사했습니다.
+              <br />
+              그중 <b style={{ color: "#2556a0" }}>
+                {purgeScan.recovered}개
+              </b>{" "}
+              는 세션 기록에서 응답을 되살렸습니다.
+              {purgeScan.protected > 0 && (
+                <>
+                  <br />
+                  북마크·태그가 달린 <b>{purgeScan.protected}개</b>는 검사에서
+                  제외했습니다.
+                </>
+              )}
+            </div>
+
+            {purgeScan.candidates.length === 0 ? (
+              <div
+                style={{
+                  padding: "16px 0",
+                  fontSize: 13,
+                  color: "#2a7",
+                  textAlign: "center",
+                }}
+              >
+                지울 프롬프트가 없습니다.
+              </div>
+            ) : (
+              <>
+                <div style={{ fontSize: 13, color: "#a33" }}>
+                  아래 <b>{purgeScan.candidates.length}개</b>는 응답을 되살리지
+                  못했습니다. 삭제하면 되돌릴 수 없습니다.
+                </div>
+                <div
+                  style={{
+                    fontSize: 12,
+                    color: "#2a6",
+                    background: "#f2faf5",
+                    border: "1px solid #d6ecdd",
+                    borderRadius: 6,
+                    padding: "6px 10px",
+                  }}
+                >
+                  삭제 직전에 DB 전체가 <code>~/.claude/recall-backups/</code> 에
+                  자동 백업됩니다. 되돌리려면 그 파일을{" "}
+                  <code>~/.claude/prompts.db</code> 로 복사하세요.
+                </div>
+                <div
+                  style={{
+                    flex: 1,
+                    overflowY: "auto",
+                    border: "1px solid #eee",
+                    borderRadius: 6,
+                  }}
+                >
+                  {purgeScan.candidates.map((c) => (
+                    <div
+                      key={c.id}
+                      style={{
+                        padding: "8px 10px",
+                        borderBottom: "1px solid #f2f2f2",
+                        fontSize: 12,
+                      }}
+                    >
+                      <div style={{ color: "#999", fontSize: 11 }}>
+                        {c.created_at}
+                        {c.cwd ? ` · ${shortenCwd(c.cwd)}` : ""}
+                      </div>
+                      <div
+                        style={{
+                          whiteSpace: "nowrap",
+                          overflow: "hidden",
+                          textOverflow: "ellipsis",
+                          color: "#333",
+                        }}
+                      >
+                        {c.prompt.replace(/\s+/g, " ").slice(0, 90)}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </>
+            )}
+
+            <div
+              style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}
+            >
+              <button
+                onClick={() => setPurgeScan(null)}
+                disabled={purgeDeleting}
+              >
+                닫기
+              </button>
+              {purgeScan.candidates.length > 0 && (
+                <button
+                  onClick={purgeCandidates}
+                  disabled={purgeDeleting}
+                  style={{
+                    background: "#c0392b",
+                    color: "#fff",
+                    border: "none",
+                    borderRadius: 6,
+                    padding: "8px 14px",
+                    cursor: purgeDeleting ? "default" : "pointer",
+                  }}
+                >
+                  {purgeDeleting
+                    ? "삭제 중…"
+                    : `${purgeScan.candidates.length}개 삭제`}
+                </button>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
