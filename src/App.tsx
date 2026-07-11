@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { getVersion } from "@tauri-apps/api/app";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -64,6 +65,24 @@ const sourceLabel = (s: PromptResponse["source"]) => {
   return "JSONL에서 가져옴";
 };
 
+/// 원형 되돌리기 화살표. 유니코드 ⟳ 는 폰트가 크기·두께를 정해버려 작게 나오므로 직접 그린다.
+const RefetchIcon = ({ size = 16 }: { size?: number }) => (
+  <svg
+    width={size}
+    height={size}
+    viewBox="0 0 24 24"
+    fill="none"
+    stroke="currentColor"
+    strokeWidth={2.6}
+    strokeLinecap="round"
+    strokeLinejoin="round"
+    style={{ display: "block", flexShrink: 0 }}
+  >
+    <path d="M20.5 12a8.5 8.5 0 1 1-2.5-6" />
+    <polyline points="20.5 3.2 20.5 9 14.7 9" />
+  </svg>
+);
+
 const NULL_CWD_KEY = "__NULL__";
 const ALL_KEY = "__ALL__";
 
@@ -91,6 +110,7 @@ export default function App() {
   const [dateFrom, setDateFrom] = useState("");
   const [dateTo, setDateTo] = useState("");
   const [toast, setToast] = useState("");
+  const [report, setReport] = useState("");
   const [error, setError] = useState("");
   const [editingCwd, setEditingCwd] = useState<string | null>(null);
   const [editValue, setEditValue] = useState("");
@@ -107,6 +127,9 @@ export default function App() {
   const [purgeScan, setPurgeScan] = useState<PurgeScan | null>(null);
   const [purgeDeleting, setPurgeDeleting] = useState(false);
   const [lastBackup, setLastBackup] = useState("");
+  const [appVersion, setAppVersion] = useState("");
+  const [refetchAllLoading, setRefetchAllLoading] = useState(false);
+  const [confirmRefetchAll, setConfirmRefetchAll] = useState(false);
 
   const loadCwds = async () => {
     try {
@@ -136,10 +159,10 @@ export default function App() {
     setBatchLoading(true);
     try {
       const r = await invoke<BatchFetchResult>("fetch_recent_responses");
-      showToast(
-        `24시간 응답 갱신: ${r.fetched}/${r.total} 가져옴` +
-          (r.not_found ? ` · 미발견 ${r.not_found}` : "") +
-          (r.failed ? ` · 실패 ${r.failed}` : "")
+      showReport(
+        `최근 24시간 · 대상 ${r.total}개 중 ${r.fetched}개 응답을 가져왔습니다.` +
+          (r.not_found ? ` 응답을 찾지 못함 ${r.not_found}개.` : "") +
+          (r.failed ? ` 세션 기록이 없어 건너뜀 ${r.failed}개.` : "")
       );
       await loadPrompts();
       if (selected) await loadResponse(selected.id);
@@ -180,11 +203,37 @@ export default function App() {
       if (selected && ids.includes(selected.id)) setSelected(null);
       await Promise.all([loadCwds(), loadTags(), loadPrompts()]);
       setLastBackup(r.backup_path);
-      showToast(`${r.deleted}개 삭제됨 · 백업 저장됨`);
+      showReport(`${r.deleted}개를 삭제했습니다. 삭제 전 DB 백업이 저장되었습니다.`);
     } catch (e) {
       setError(String(e));
     } finally {
       setPurgeDeleting(false);
+    }
+  };
+
+  // 저장된 응답을 전부 버리고 현재 매칭 로직으로 다시 추출한다.
+  // 앱을 새 버전으로 올린 직후 한 번 돌리면 과거 기록까지 새 로직이 적용된다.
+  const refetchAllResponses = async () => {
+    if (refetchAllLoading) return;
+    setConfirmRefetchAll(false);
+    setRefetchAllLoading(true);
+    try {
+      const r = await invoke<BatchFetchResult>("refetch_all_responses");
+      showReport(
+        `전체 재추출 · 프롬프트 ${r.total}개 중 ${r.fetched}개를 현재 로직으로 다시 추출했습니다.` +
+          (r.not_found
+            ? ` 세션 기록에 응답이 없어 그대로 둔 것 ${r.not_found}개 (ESC로 취소한 턴 등).`
+            : "") +
+          (r.failed
+            ? ` 세션 기록이 사라져 손대지 않은 것 ${r.failed}개 — 저장돼 있던 응답은 그대로 유지됩니다.`
+            : "")
+      );
+      await loadPrompts();
+      if (selected) await loadResponse(selected.id);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setRefetchAllLoading(false);
     }
   };
 
@@ -212,7 +261,20 @@ export default function App() {
   useEffect(() => {
     loadCwds();
     loadTags();
+    getVersion().then(setAppVersion).catch(() => {});
   }, []);
+
+  // 되돌릴 수 없는 작업의 확인 상태는 ESC 로도 빠져나올 수 있어야 한다.
+  // 실행이 이미 시작됐다면 취소하지 않는다.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      if (!refetchAllLoading) setConfirmRefetchAll(false);
+      if (!purgeDeleting) setPurgeScan(null);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [refetchAllLoading, purgeDeleting]);
 
   useEffect(() => {
     loadPrompts();
@@ -283,10 +345,15 @@ export default function App() {
     showToast("응답 복사됨");
   };
 
+  // 짧은 확인용. "저장됨" 같은 스쳐도 되는 메시지에만 쓴다.
   const showToast = (msg: string) => {
     setToast(msg);
-    setTimeout(() => setToast(""), 1500);
+    setTimeout(() => setToast(""), 2500);
   };
+
+  // 배치 작업 결과는 읽고 판단해야 하는 데이터라 자동으로 사라지면 안 된다.
+  // 직접 닫을 때까지 남는 배너로 보여준다.
+  const showReport = (msg: string) => setReport(msg);
 
   const save = async () => {
     if (!selected) return;
@@ -627,6 +694,20 @@ export default function App() {
             )}
           </ul>
         </div>
+        <div
+          style={{
+            borderTop: "1px solid #eee",
+            padding: "8px 12px",
+            fontSize: 11,
+            color: "#aaa",
+            display: "flex",
+            justifyContent: "space-between",
+            alignItems: "center",
+          }}
+        >
+          <span>Recall</span>
+          <span>{appVersion ? `v${appVersion}` : ""}</span>
+        </div>
       </aside>
 
       <aside
@@ -647,8 +728,19 @@ export default function App() {
             display: "flex",
             gap: 8,
             alignItems: "center",
+            flexWrap: "wrap",
           }}
         >
+          {/* 첫 줄은 필터 계열(검색 + 북마크)이 차지하고, 동작 버튼들은 아래 줄에 놓는다.
+              목록 패널이 좁아 전부 한 줄에 두면 검색창이 찌그러진다. */}
+          <div
+            style={{
+              display: "flex",
+              gap: 8,
+              alignItems: "center",
+              flex: "1 1 100%",
+            }}
+          >
           <div style={{ position: "relative", flex: 1 }}>
             <input
               placeholder="검색..."
@@ -692,21 +784,23 @@ export default function App() {
               </button>
             )}
           </div>
-          <button
-            onClick={() => setOnlyBookmarked((v) => !v)}
-            title={onlyBookmarked ? "전체 보기" : "북마크만 보기"}
-            style={{
-              padding: "8px 12px",
-              border: "1px solid #ddd",
-              borderRadius: 6,
-              background: onlyBookmarked ? "#fff3cd" : "#fff",
-              cursor: "pointer",
-              fontSize: 14,
-              color: onlyBookmarked ? "#b58900" : "#888",
-            }}
-          >
-            {onlyBookmarked ? "★" : "☆"}
-          </button>
+            <button
+              onClick={() => setOnlyBookmarked((v) => !v)}
+              title={onlyBookmarked ? "전체 보기" : "북마크만 보기"}
+              style={{
+                padding: "8px 12px",
+                border: "1px solid #ddd",
+                borderRadius: 6,
+                background: onlyBookmarked ? "#fff3cd" : "#fff",
+                cursor: "pointer",
+                fontSize: 14,
+                color: onlyBookmarked ? "#b58900" : "#888",
+                flexShrink: 0,
+              }}
+            >
+              {onlyBookmarked ? "★" : "☆"}
+            </button>
+          </div>
           <button
             onClick={refreshAll}
             title="새로고침"
@@ -738,6 +832,69 @@ export default function App() {
           >
             {batchLoading ? "가져오는 중…" : "⤓ 24h"}
           </button>
+          {confirmRefetchAll ? (
+            <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+              <button
+                onClick={refetchAllResponses}
+                disabled={refetchAllLoading}
+                title="모든 프롬프트의 응답을 세션 기록에서 다시 읽어 갱신합니다. 기록이 없는 응답은 그대로 둡니다."
+                style={{
+                  padding: "8px 10px",
+                  border: "1px solid #2556a0",
+                  borderRadius: 6,
+                  background: "#2556a0",
+                  color: "#fff",
+                  cursor: "pointer",
+                  fontSize: 12,
+                  whiteSpace: "nowrap",
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 5,
+                }}
+              >
+                <RefetchIcon size={16} />
+                모두 다시 가져오기
+              </button>
+              <button
+                onClick={() => setConfirmRefetchAll(false)}
+                disabled={refetchAllLoading}
+                style={{
+                  padding: "8px 10px",
+                  border: "1px solid #ddd",
+                  borderRadius: 6,
+                  background: "#fff",
+                  cursor: "pointer",
+                  fontSize: 12,
+                  whiteSpace: "nowrap",
+                  color: "#666",
+                }}
+              >
+                취소
+              </button>
+            </div>
+          ) : (
+            <button
+              onClick={() => setConfirmRefetchAll(true)}
+              disabled={refetchAllLoading}
+              title="모든 프롬프트의 응답을 세션 기록에서 다시 읽어 갱신합니다. 앱을 새 버전으로 올린 뒤 한 번 실행하면 과거 기록에도 최신 로직이 적용됩니다. 기록이 사라진 응답은 그대로 유지됩니다."
+              style={{
+                padding: "8px 10px",
+                border: "1px solid #ddd",
+                borderRadius: 6,
+                background: refetchAllLoading ? "#eef" : "#fff",
+                cursor: refetchAllLoading ? "default" : "pointer",
+                fontSize: 12,
+                whiteSpace: "nowrap",
+                color: refetchAllLoading ? "#888" : "#2556a0",
+                display: "flex",
+                alignItems: "center",
+                gap: 5,
+              }}
+            >
+              <RefetchIcon size={16} />
+              {refetchAllLoading ? "재추출 중…" : "전체"}
+            </button>
+          )}
           <button
             onClick={scanUnanswered}
             disabled={purgeScanning}
@@ -1283,7 +1440,8 @@ export default function App() {
           <div
             style={{
               position: "fixed",
-              bottom: 28,
+              // 결과 배너가 떠 있으면 그 위로 밀어 겹치지 않게 한다.
+              bottom: report ? 110 : 28,
               right: 28,
               background: "#333",
               color: "#fff",
@@ -1296,6 +1454,45 @@ export default function App() {
           </div>
         )}
       </main>
+
+      {report && (
+        <div
+          style={{
+            position: "fixed",
+            bottom: 28,
+            right: 28,
+            maxWidth: 480,
+            background: "#1f2937",
+            color: "#f3f4f6",
+            borderRadius: 10,
+            padding: "14px 16px",
+            fontSize: 13,
+            lineHeight: 1.6,
+            display: "flex",
+            gap: 12,
+            alignItems: "flex-start",
+            boxShadow: "0 8px 28px rgba(0,0,0,0.28)",
+            zIndex: 95,
+          }}
+        >
+          <div style={{ flex: 1 }}>{report}</div>
+          <button
+            onClick={() => setReport("")}
+            style={{
+              background: "transparent",
+              border: "1px solid #4b5563",
+              color: "#d1d5db",
+              borderRadius: 6,
+              padding: "3px 9px",
+              fontSize: 12,
+              cursor: "pointer",
+              flexShrink: 0,
+            }}
+          >
+            닫기
+          </button>
+        </div>
+      )}
 
       {lastBackup && (
         <div

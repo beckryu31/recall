@@ -28,6 +28,7 @@ Everything stays on your machine. No network calls, no telemetry, no account.
 - **Filter by date range.**
 - **Read the response** — Recall finds the session transcript for a prompt and extracts what Claude replied, rendered as Markdown.
 - **Edit and copy** — fix up a prompt for reuse, then copy it to the clipboard.
+- **Re-fetch everything** — re-read every response from the transcripts with the current matching logic. Run it once after upgrading and your old history gets the new logic too. Responses whose transcript is gone are left untouched.
 - **Clean up** — sweep the prompts that have no response. Recall first tries to recover each one from the transcripts, and only offers the genuinely unanswerable ones (a prompt you cancelled with ESC, a session whose transcript is gone) for deletion. It backs the database up before deleting anything.
 
 ---
@@ -121,6 +122,12 @@ npm run tauri build    # production bundle
 > sqlite3 ~/.claude/prompts.db "ALTER TABLE prompts ADD COLUMN response TEXT;"
 > ```
 
+### Upgrading the app
+
+There is no auto-updater — drop the new build over `/Applications/Recall.app` yourself. Your data lives in `~/.claude/prompts.db`, outside the bundle, so it survives untouched. Schema changes are applied on launch; you never have to run SQL.
+
+One thing worth doing after an upgrade: **hit `⟳ 전체` (re-fetch everything) once.** Recall caches each response in the database and won't re-read the transcript once it has one — so if a release changes how responses are extracted, prompts that were *already* filled in keep the old result forever. Re-fetching re-reads them all with the current logic. It never deletes: a response whose transcript is gone is left exactly as it was.
+
 ---
 
 ## Your data
@@ -158,6 +165,7 @@ To undo a cleanup, copy the snapshot back over `~/.claude/prompts.db`.
 
 ## Known limitations
 
+- **Transcripts don't live forever — fetch responses before they're gone.** Claude Code prunes old session transcripts, and once a `.jsonl` is deleted its responses are unrecoverable. Prompts survive regardless (the hook copies them into the database the moment you submit), but a response only becomes yours once Recall has fetched it. On the machine this was built on, **57% of the recorded sessions no longer had a transcript on disk.** Press `⤓ 24h` now and then; it is the difference between keeping an answer and losing it.
 - **A prompt with no response is usually correct, not a bug.** If you cancelled a turn with ESC before Claude answered, there is genuinely no response to show. Recall no longer confuses this with a failed lookup.
 - **Response lookup can still miss.** The transcript event is resolved by timestamp and text prefix, so a deleted or truncated `.jsonl` leaves the prompt without a response. The prompt itself still shows.
 - **Responses are summarized, not replayed.** Text blocks are kept verbatim; tool calls are collapsed to a `[tool: Read]` marker. Recall shows you what Claude *said*, not everything it *did*.
