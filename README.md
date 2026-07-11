@@ -28,6 +28,7 @@ Everything stays on your machine. No network calls, no telemetry, no account.
 - **Filter by date range.**
 - **Read the response** — Recall finds the session transcript for a prompt and extracts what Claude replied, rendered as Markdown.
 - **Edit and copy** — fix up a prompt for reuse, then copy it to the clipboard.
+- **Clean up** — sweep the prompts that have no response. Recall first tries to recover each one from the transcripts, and only offers the genuinely unanswerable ones (a prompt you cancelled with ESC, a session whose transcript is gone) for deletion. It backs the database up before deleting anything.
 
 ---
 
@@ -56,7 +57,9 @@ Recall reads two data sources that Claude Code already writes to your disk, and 
                          └─────────────┘
 ```
 
-The hook captures prompts as you write them. The responses aren't in the database — they're in Claude Code's session transcripts — so when you open a prompt, Recall locates the matching `.jsonl` file, scans for the `user` line whose text matches the prompt exactly, collects the `assistant` blocks that follow, and caches the result back into the database.
+The hook captures prompts as you write them. The responses aren't in the database — they're in Claude Code's session transcripts — so when you open a prompt, Recall locates the matching `.jsonl` file, finds the `user` event that produced it, collects the `assistant` blocks that follow, and caches the result back into the database.
+
+Finding the right `user` event is the tricky part. Matching on the prompt text alone doesn't work: a transcript's `message.content` is sometimes a plain string, sometimes an array of blocks (any prompt with an image attachment), and sometimes a command wrapper. So Recall matches on the transcript event's **`uuid`** instead — resolved once by timestamp (±30s window, tie-broken by a text prefix), then cached in `prompts.msg_uuid` so later lookups are exact. Collection stops at the next real user prompt, which keeps an interrupted turn from swallowing the next answer.
 
 **Stack:** Tauri 2 (Rust backend) + React 19 + TypeScript. Rust isn't here for speed — it's here because a browser sandbox can't read `~/.claude`.
 
@@ -128,26 +131,37 @@ Recall is entirely offline. It touches exactly two locations, both already on yo
 |---|---|
 | `~/.claude/prompts.db` | read **and write** |
 | `~/.claude/projects/**/*.jsonl` | read only |
+| `~/.claude/recall-backups/` | written before any bulk delete |
 
-The `prompts` table is created by the hook. On first launch, the app adds five tables of its own for the metadata it manages — bookmarks, tags, directory aliases, and a response cache:
+The `prompts` table is created by the hook. On first launch, the app adds five tables of its own for the metadata it manages — bookmarks, tags, directory aliases, and a response cache — plus a `msg_uuid` column on `prompts` to cache the resolved transcript event:
 
 ```sql
-prompts(id, session_id, cwd, prompt, created_at, response)  -- written by the hook
+prompts(id, session_id, cwd, prompt, created_at, response, msg_uuid)  -- rows written by the hook
 cwd_aliases(cwd, alias, updated_at)
 prompt_bookmarks(prompt_id, created_at)
 tags(id, name, created_at)
 prompt_tags(prompt_id, tag_id)
-prompt_responses(prompt_id, response, fetched_at)           -- legacy cache
+prompt_responses(prompt_id, response, fetched_at)                     -- legacy cache
 ```
 
-**Recall can modify and delete your prompt history.** Editing a prompt runs an `UPDATE` on the `prompts` row, and deleting one is a real `DELETE` — there's no undo and no trash. Back up `~/.claude/prompts.db` if that history matters to you.
+**Recall can modify and delete your prompt history.** Editing a prompt runs an `UPDATE` on the `prompts` row, and deleting one is a real `DELETE` — there is no undo and no trash.
+
+Bulk cleanup is the one destructive operation that protects itself:
+
+- Prompts that carry a **bookmark or a tag are never offered for deletion** — you touched them, so Recall leaves them alone.
+- Every prompt is **re-checked against the transcripts first**; anything whose response can be recovered is recovered and dropped from the list.
+- The database is **snapshotted to `~/.claude/recall-backups/` before a single row is deleted** (via `VACUUM INTO`, so the copy is transactionally consistent). If the backup fails, nothing is deleted. The ten most recent snapshots are kept.
+
+To undo a cleanup, copy the snapshot back over `~/.claude/prompts.db`.
 
 ---
 
 ## Known limitations
 
-- **Response lookup matches on exact prompt text.** If the same prompt appears twice in one session, Recall attaches the first response it finds. If a prompt was edited or stored in a form that differs from the transcript, the lookup can miss entirely — the prompt still shows, just without a response.
+- **A prompt with no response is usually correct, not a bug.** If you cancelled a turn with ESC before Claude answered, there is genuinely no response to show. Recall no longer confuses this with a failed lookup.
+- **Response lookup can still miss.** The transcript event is resolved by timestamp and text prefix, so a deleted or truncated `.jsonl` leaves the prompt without a response. The prompt itself still shows.
 - **Responses are summarized, not replayed.** Text blocks are kept verbatim; tool calls are collapsed to a `[tool: Read]` marker. Recall shows you what Claude *said*, not everything it *did*.
+- **Slash commands never reach the database.** The `UserPromptSubmit` hook receives no prompt text for `/some-command`, so no row is written. They exist in the transcripts but not in Recall.
 - **Only prompts logged after the hook is installed appear.** There's no backfill from existing transcripts.
 - **Sessions are grouped by their first working directory.** If you `cd` mid-session, every prompt in that session is still filed under where it started.
 - macOS is the only platform this has been used on. Tauri should build on Linux and Windows, but neither is tested.
