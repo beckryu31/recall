@@ -1,0 +1,1223 @@
+import { useEffect, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
+import { writeText } from "@tauri-apps/plugin-clipboard-manager";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
+
+type Prompt = {
+  id: number;
+  session_id: string | null;
+  cwd: string | null;
+  prompt: string;
+  created_at: string;
+  bookmarked: boolean;
+  tags: string[];
+  has_response: boolean;
+};
+
+type CwdGroup = {
+  cwd: string | null;
+  alias: string | null;
+  count: number;
+};
+
+type TagGroup = {
+  name: string;
+  count: number;
+};
+
+type PromptResponse = {
+  response: string;
+  fetched_at: string;
+  source: "saved" | "cache" | "jsonl";
+};
+
+type BatchFetchResult = {
+  total: number;
+  fetched: number;
+  not_found: number;
+  failed: number;
+};
+
+const sourceLabel = (s: PromptResponse["source"]) => {
+  if (s === "saved") return "저장됨";
+  if (s === "cache") return "캐시됨";
+  return "JSONL에서 가져옴";
+};
+
+const NULL_CWD_KEY = "__NULL__";
+const ALL_KEY = "__ALL__";
+
+const shortenCwd = (cwd: string) => {
+  const parts = cwd.split("/").filter(Boolean);
+  return parts.slice(-2).join("/") || cwd;
+};
+
+const displayName = (g: CwdGroup) => {
+  if (g.alias && g.alias.trim()) return g.alias;
+  if (!g.cwd) return "(경로 없음)";
+  return shortenCwd(g.cwd);
+};
+
+export default function App() {
+  const [cwds, setCwds] = useState<CwdGroup[]>([]);
+  const [cwdFilter, setCwdFilter] = useState<string>(ALL_KEY);
+  const [tagList, setTagList] = useState<TagGroup[]>([]);
+  const [tagFilter, setTagFilter] = useState<string>("");
+  const [prompts, setPrompts] = useState<Prompt[]>([]);
+  const [selected, setSelected] = useState<Prompt | null>(null);
+  const [draft, setDraft] = useState("");
+  const [search, setSearch] = useState("");
+  const [onlyBookmarked, setOnlyBookmarked] = useState(false);
+  const [dateFrom, setDateFrom] = useState("");
+  const [dateTo, setDateTo] = useState("");
+  const [toast, setToast] = useState("");
+  const [error, setError] = useState("");
+  const [editingCwd, setEditingCwd] = useState<string | null>(null);
+  const [editValue, setEditValue] = useState("");
+  const [tagInput, setTagInput] = useState("");
+  const [tagInputVisible, setTagInputVisible] = useState(false);
+  const [response, setResponse] = useState<PromptResponse | null>(null);
+  const [responseDraft, setResponseDraft] = useState("");
+  const [responseLoading, setResponseLoading] = useState(false);
+  const [responseError, setResponseError] = useState("");
+  const [responseEditing, setResponseEditing] = useState(false);
+  const [batchLoading, setBatchLoading] = useState(false);
+  const [confirmingDelete, setConfirmingDelete] = useState(false);
+
+  const loadCwds = async () => {
+    try {
+      const rows = await invoke<CwdGroup[]>("list_cwds");
+      setCwds(rows);
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
+  const loadTags = async () => {
+    try {
+      const rows = await invoke<TagGroup[]>("list_tags");
+      setTagList(rows);
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
+  const refreshAll = async () => {
+    await Promise.all([loadCwds(), loadTags(), loadPrompts()]);
+    showToast("새로고침됨");
+  };
+
+  const fetchRecentResponses = async () => {
+    if (batchLoading) return;
+    setBatchLoading(true);
+    try {
+      const r = await invoke<BatchFetchResult>("fetch_recent_responses");
+      showToast(
+        `24시간 응답 갱신: ${r.fetched}/${r.total} 가져옴` +
+          (r.not_found ? ` · 미발견 ${r.not_found}` : "") +
+          (r.failed ? ` · 실패 ${r.failed}` : "")
+      );
+      await loadPrompts();
+      if (selected) await loadResponse(selected.id);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBatchLoading(false);
+    }
+  };
+
+  const loadPrompts = async () => {
+    try {
+      let cwdArg: string | null = null;
+      if (cwdFilter !== ALL_KEY) cwdArg = cwdFilter;
+      const rows = await invoke<Prompt[]>("list_prompts", {
+        limit: 200,
+        offset: 0,
+        search: search || null,
+        cwd: cwdArg,
+        onlyBookmarked,
+        tag: tagFilter || null,
+        dateFrom: dateFrom || null,
+        dateTo: dateTo || null,
+      });
+      setPrompts(rows);
+      setError("");
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
+  useEffect(() => {
+    loadCwds();
+    loadTags();
+  }, []);
+
+  useEffect(() => {
+    loadPrompts();
+  }, [search, cwdFilter, onlyBookmarked, tagFilter, dateFrom, dateTo]);
+
+  const loadResponse = async (promptId: number, refresh = false) => {
+    setResponseLoading(true);
+    setResponseError("");
+    setResponse(null);
+    setResponseDraft("");
+    try {
+      const r = await invoke<PromptResponse | null>("get_response", {
+        promptId,
+        refresh,
+      });
+      setResponse(r);
+      setResponseDraft(r?.response ?? "");
+      if (!r) setResponseError("이 프롬프트에 해당하는 응답을 찾을 수 없습니다");
+      else markHasResponse(promptId, true);
+    } catch (e) {
+      setResponseError(String(e));
+    } finally {
+      setResponseLoading(false);
+    }
+  };
+
+  const markHasResponse = (promptId: number, has: boolean) => {
+    setPrompts((prev) =>
+      prev.map((x) => (x.id === promptId ? { ...x, has_response: has } : x))
+    );
+    setSelected((prev) =>
+      prev && prev.id === promptId ? { ...prev, has_response: has } : prev
+    );
+  };
+
+  const saveResponseToPrompt = async () => {
+    if (!selected) return;
+    await invoke("save_response", {
+      promptId: selected.id,
+      response: responseDraft,
+    });
+    showToast("응답 저장됨");
+    setResponse({
+      response: responseDraft,
+      fetched_at: new Date().toISOString(),
+      source: "saved",
+    });
+    markHasResponse(selected.id, !!responseDraft);
+  };
+
+  const select = (p: Prompt) => {
+    setSelected(p);
+    setDraft(p.prompt);
+    setTagInput("");
+    setTagInputVisible(false);
+    setResponseEditing(false);
+    setConfirmingDelete(false);
+    loadResponse(p.id);
+  };
+
+  const refreshResponse = () => {
+    if (selected) loadResponse(selected.id, true);
+  };
+
+  const copyResponse = async () => {
+    if (!responseDraft) return;
+    await writeText(responseDraft);
+    showToast("응답 복사됨");
+  };
+
+  const showToast = (msg: string) => {
+    setToast(msg);
+    setTimeout(() => setToast(""), 1500);
+  };
+
+  const save = async () => {
+    if (!selected) return;
+    await invoke("update_prompt", { id: selected.id, prompt: draft });
+    showToast("저장됨");
+    loadPrompts();
+  };
+
+  const copy = async () => {
+    await writeText(draft);
+    showToast("복사됨");
+  };
+
+  const addTagToSelected = async () => {
+    if (!selected) return;
+    const name = tagInput.trim();
+    if (!name) return;
+    if (selected.tags.includes(name)) {
+      setTagInput("");
+      setTagInputVisible(false);
+      return;
+    }
+    await invoke("add_prompt_tag", { promptId: selected.id, name });
+    const nextTags = [...selected.tags, name];
+    const updated = { ...selected, tags: nextTags };
+    setSelected(updated);
+    setPrompts((prev) =>
+      prev.map((x) => (x.id === selected.id ? { ...x, tags: nextTags } : x))
+    );
+    setTagInput("");
+    setTagInputVisible(false);
+    loadTags();
+    showToast("태그 추가됨");
+  };
+
+  const removeTagFromSelected = async (name: string) => {
+    if (!selected) return;
+    await invoke("remove_prompt_tag", { promptId: selected.id, name });
+    const nextTags = selected.tags.filter((t) => t !== name);
+    const updated = { ...selected, tags: nextTags };
+    setSelected(updated);
+    setPrompts((prev) =>
+      prev.map((x) => (x.id === selected.id ? { ...x, tags: nextTags } : x))
+    );
+    loadTags();
+    if (tagFilter === name) {
+      loadPrompts();
+    }
+    showToast("태그 삭제됨");
+  };
+
+  const toggleBookmark = async (p: Prompt) => {
+    const next = !p.bookmarked;
+    await invoke("toggle_bookmark", { promptId: p.id, bookmarked: next });
+    setPrompts((prev) =>
+      prev.map((x) => (x.id === p.id ? { ...x, bookmarked: next } : x))
+    );
+    if (selected?.id === p.id) {
+      setSelected({ ...p, bookmarked: next });
+    }
+    if (onlyBookmarked && !next) {
+      setPrompts((prev) => prev.filter((x) => x.id !== p.id));
+    }
+    showToast(next ? "북마크됨" : "북마크 해제됨");
+  };
+
+  const remove = async () => {
+    if (!selected) return;
+    try {
+      await invoke("delete_prompt", { id: selected.id });
+      setConfirmingDelete(false);
+      setSelected(null);
+      setDraft("");
+      loadPrompts();
+      loadCwds();
+      showToast("삭제됨");
+    } catch (e) {
+      setError(String(e));
+      showToast("삭제 실패");
+    }
+  };
+
+  const beginEdit = (g: CwdGroup) => {
+    if (!g.cwd) {
+      showToast("경로 없음 항목은 별칭 지정 불가");
+      return;
+    }
+    setEditingCwd(g.cwd);
+    setEditValue(g.alias ?? "");
+  };
+
+  const cancelEdit = () => {
+    setEditingCwd(null);
+    setEditValue("");
+  };
+
+  const saveAlias = async () => {
+    if (!editingCwd) return;
+    await invoke("set_cwd_alias", { cwd: editingCwd, alias: editValue });
+    showToast(editValue.trim() ? "별칭 저장됨" : "별칭 삭제됨");
+    setEditingCwd(null);
+    setEditValue("");
+    loadCwds();
+  };
+
+  const totalCount = cwds.reduce((s, g) => s + g.count, 0);
+
+  const cwdItemStyle = (active: boolean): React.CSSProperties => ({
+    padding: "10px 14px",
+    borderBottom: "1px solid #f0f0f0",
+    background: active ? "#eef" : "transparent",
+    cursor: "pointer",
+    display: "flex",
+    alignItems: "center",
+    gap: 8,
+    fontSize: 13,
+  });
+
+  return (
+    <div
+      style={{
+        display: "flex",
+        height: "100vh",
+        fontFamily: "system-ui",
+        padding: 16,
+        gap: 16,
+        boxSizing: "border-box",
+        background: "#fafafa",
+      }}
+    >
+      <aside
+        style={{
+          width: 240,
+          border: "1px solid #e5e5e5",
+          borderRadius: 8,
+          background: "#fff",
+          display: "flex",
+          flexDirection: "column",
+          overflow: "hidden",
+        }}
+      >
+        <div
+          style={{
+            flex: 1,
+            display: "flex",
+            flexDirection: "column",
+            minHeight: 0,
+            borderBottom: "1px solid #eee",
+          }}
+        >
+        <div
+          style={{
+            padding: "12px 14px",
+            borderBottom: "1px solid #eee",
+            fontSize: 12,
+            fontWeight: 600,
+            color: "#555",
+            letterSpacing: 0.3,
+          }}
+        >
+          경로 (CWD)
+        </div>
+        <ul
+          style={{
+            listStyle: "none",
+            margin: 0,
+            padding: 0,
+            overflowY: "auto",
+            flex: 1,
+          }}
+        >
+          <li
+            onClick={() => setCwdFilter(ALL_KEY)}
+            style={cwdItemStyle(cwdFilter === ALL_KEY)}
+          >
+            <span style={{ flex: 1, fontWeight: 500 }}>전체</span>
+            <span style={{ fontSize: 11, color: "#888" }}>{totalCount}</span>
+          </li>
+          {cwds.map((g, i) => {
+            const key = g.cwd ?? NULL_CWD_KEY;
+            const active = cwdFilter === key;
+            const isEditing = editingCwd !== null && editingCwd === g.cwd;
+            if (isEditing) {
+              return (
+                <li
+                  key={i}
+                  style={{
+                    padding: "10px 14px",
+                    borderBottom: "1px solid #f0f0f0",
+                    background: "#fffbe6",
+                    display: "flex",
+                    flexDirection: "column",
+                    gap: 6,
+                  }}
+                >
+                  <div
+                    style={{
+                      fontSize: 11,
+                      color: "#888",
+                      whiteSpace: "nowrap",
+                      overflow: "hidden",
+                      textOverflow: "ellipsis",
+                    }}
+                    title={g.cwd ?? ""}
+                  >
+                    {g.cwd}
+                  </div>
+                  <input
+                    autoFocus
+                    value={editValue}
+                    placeholder="별칭 (비우면 삭제)"
+                    onChange={(e) => setEditValue(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") saveAlias();
+                      if (e.key === "Escape") cancelEdit();
+                    }}
+                    style={{
+                      padding: 6,
+                      border: "1px solid #ddd",
+                      borderRadius: 4,
+                      fontSize: 12,
+                    }}
+                  />
+                  <div style={{ display: "flex", gap: 6, justifyContent: "flex-end" }}>
+                    <button onClick={cancelEdit} style={{ fontSize: 11, padding: "2px 8px" }}>
+                      취소
+                    </button>
+                    <button onClick={saveAlias} style={{ fontSize: 11, padding: "2px 8px" }}>
+                      저장
+                    </button>
+                  </div>
+                </li>
+              );
+            }
+            return (
+              <li
+                key={i}
+                onClick={() => setCwdFilter(key)}
+                style={cwdItemStyle(active)}
+                title={g.cwd ?? "(경로 없음)"}
+              >
+                <span
+                  style={{
+                    flex: 1,
+                    whiteSpace: "nowrap",
+                    overflow: "hidden",
+                    textOverflow: "ellipsis",
+                  }}
+                >
+                  {displayName(g)}
+                </span>
+                <span style={{ fontSize: 11, color: "#888" }}>{g.count}</span>
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    beginEdit(g);
+                  }}
+                  style={{
+                    border: "none",
+                    background: "transparent",
+                    cursor: "pointer",
+                    fontSize: 12,
+                    color: "#888",
+                    padding: "2px 4px",
+                  }}
+                  title="별칭 편집"
+                >
+                  ✎
+                </button>
+              </li>
+            );
+          })}
+        </ul>
+        </div>
+
+        <div
+          style={{
+            flex: 1,
+            display: "flex",
+            flexDirection: "column",
+            minHeight: 0,
+          }}
+        >
+          <div
+            style={{
+              padding: "12px 14px",
+              borderBottom: "1px solid #eee",
+              fontSize: 12,
+              fontWeight: 600,
+              color: "#555",
+              letterSpacing: 0.3,
+            }}
+          >
+            태그
+          </div>
+          <ul
+            style={{
+              listStyle: "none",
+              margin: 0,
+              padding: 0,
+              overflowY: "auto",
+              flex: 1,
+            }}
+          >
+            <li
+              onClick={() => setTagFilter("")}
+              style={cwdItemStyle(tagFilter === "")}
+            >
+              <span style={{ flex: 1, fontWeight: 500 }}>전체</span>
+              <span style={{ fontSize: 11, color: "#888" }}>
+                {tagList.reduce((s, t) => s + t.count, 0)}
+              </span>
+            </li>
+            {tagList.map((t) => (
+              <li
+                key={t.name}
+                onClick={() => setTagFilter(t.name)}
+                style={cwdItemStyle(tagFilter === t.name)}
+                title={t.name}
+              >
+                <span
+                  style={{
+                    flex: 1,
+                    whiteSpace: "nowrap",
+                    overflow: "hidden",
+                    textOverflow: "ellipsis",
+                  }}
+                >
+                  #{t.name}
+                </span>
+                <span style={{ fontSize: 11, color: "#888" }}>{t.count}</span>
+              </li>
+            ))}
+            {tagList.length === 0 && (
+              <li style={{ padding: 12, color: "#aaa", fontSize: 12 }}>
+                태그 없음
+              </li>
+            )}
+          </ul>
+        </div>
+      </aside>
+
+      <aside
+        style={{
+          width: 360,
+          border: "1px solid #e5e5e5",
+          borderRadius: 8,
+          background: "#fff",
+          display: "flex",
+          flexDirection: "column",
+          overflow: "hidden",
+        }}
+      >
+        <div
+          style={{
+            padding: 12,
+            borderBottom: "1px solid #eee",
+            display: "flex",
+            gap: 8,
+            alignItems: "center",
+          }}
+        >
+          <div style={{ position: "relative", flex: 1 }}>
+            <input
+              placeholder="검색..."
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              style={{
+                width: "100%",
+                padding: 10,
+                paddingRight: search ? 32 : 10,
+                border: "1px solid #ddd",
+                borderRadius: 6,
+                boxSizing: "border-box",
+                fontSize: 13,
+              }}
+            />
+            {search && (
+              <button
+                onClick={() => setSearch("")}
+                title="검색어 지우기"
+                style={{
+                  position: "absolute",
+                  right: 4,
+                  top: "50%",
+                  transform: "translateY(-50%)",
+                  width: 22,
+                  height: 22,
+                  border: "none",
+                  borderRadius: "50%",
+                  background: "#eee",
+                  color: "#666",
+                  cursor: "pointer",
+                  fontSize: 13,
+                  lineHeight: 1,
+                  padding: 0,
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                }}
+              >
+                ×
+              </button>
+            )}
+          </div>
+          <button
+            onClick={() => setOnlyBookmarked((v) => !v)}
+            title={onlyBookmarked ? "전체 보기" : "북마크만 보기"}
+            style={{
+              padding: "8px 12px",
+              border: "1px solid #ddd",
+              borderRadius: 6,
+              background: onlyBookmarked ? "#fff3cd" : "#fff",
+              cursor: "pointer",
+              fontSize: 14,
+              color: onlyBookmarked ? "#b58900" : "#888",
+            }}
+          >
+            {onlyBookmarked ? "★" : "☆"}
+          </button>
+          <button
+            onClick={refreshAll}
+            title="새로고침"
+            style={{
+              padding: "8px 12px",
+              border: "1px solid #ddd",
+              borderRadius: 6,
+              background: "#fff",
+              cursor: "pointer",
+              fontSize: 14,
+            }}
+          >
+            ↻
+          </button>
+          <button
+            onClick={fetchRecentResponses}
+            disabled={batchLoading}
+            title="최근 24시간 내 모든 프롬프트의 응답을 가져와 갱신"
+            style={{
+              padding: "8px 10px",
+              border: "1px solid #ddd",
+              borderRadius: 6,
+              background: batchLoading ? "#eef" : "#fff",
+              cursor: batchLoading ? "default" : "pointer",
+              fontSize: 12,
+              whiteSpace: "nowrap",
+              color: batchLoading ? "#888" : "#2556a0",
+            }}
+          >
+            {batchLoading ? "가져오는 중…" : "⤓ 24h"}
+          </button>
+        </div>
+        <div
+          style={{
+            padding: "8px 12px",
+            borderBottom: "1px solid #eee",
+            display: "flex",
+            gap: 6,
+            alignItems: "center",
+            fontSize: 12,
+            color: "#666",
+            background: "#fafafa",
+          }}
+        >
+          <input
+            type="date"
+            value={dateFrom}
+            onChange={(e) => setDateFrom(e.target.value)}
+            title="시작일"
+            style={{
+              flex: 1,
+              padding: "6px 8px",
+              border: "1px solid #ddd",
+              borderRadius: 4,
+              fontSize: 12,
+              minWidth: 0,
+            }}
+          />
+          <span style={{ color: "#aaa" }}>~</span>
+          <input
+            type="date"
+            value={dateTo}
+            onChange={(e) => setDateTo(e.target.value)}
+            title="종료일"
+            style={{
+              flex: 1,
+              padding: "6px 8px",
+              border: "1px solid #ddd",
+              borderRadius: 4,
+              fontSize: 12,
+              minWidth: 0,
+            }}
+          />
+          {(dateFrom || dateTo) && (
+            <button
+              onClick={() => {
+                setDateFrom("");
+                setDateTo("");
+              }}
+              title="날짜 초기화"
+              style={{
+                border: "none",
+                background: "transparent",
+                cursor: "pointer",
+                fontSize: 14,
+                color: "#888",
+                padding: "2px 6px",
+              }}
+            >
+              ×
+            </button>
+          )}
+        </div>
+        {error && (
+          <div
+            style={{
+              margin: 12,
+              padding: 10,
+              background: "#fee",
+              color: "#900",
+              fontSize: 12,
+              borderRadius: 6,
+            }}
+          >
+            {error}
+          </div>
+        )}
+        <ul
+          style={{
+            listStyle: "none",
+            margin: 0,
+            padding: 0,
+            overflowY: "auto",
+            flex: 1,
+          }}
+        >
+          {prompts.map((p) => (
+            <li
+              key={p.id}
+              onClick={() => select(p)}
+              style={{
+                padding: "12px 14px",
+                borderBottom: "1px solid #f0f0f0",
+                background: selected?.id === p.id ? "#eef" : "transparent",
+                cursor: "pointer",
+                display: "flex",
+                gap: 8,
+                alignItems: "flex-start",
+              }}
+            >
+              <button
+                onClick={(e) => {
+                  e.stopPropagation();
+                  toggleBookmark(p);
+                }}
+                title={p.bookmarked ? "북마크 해제" : "북마크"}
+                style={{
+                  border: "none",
+                  background: "transparent",
+                  cursor: "pointer",
+                  fontSize: 16,
+                  lineHeight: 1,
+                  padding: 0,
+                  color: p.bookmarked ? "#f5a623" : "#ccc",
+                  flexShrink: 0,
+                  marginTop: 1,
+                }}
+              >
+                {p.bookmarked ? "★" : "☆"}
+              </button>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div
+                  style={{
+                    fontSize: 11,
+                    color: "#888",
+                    marginBottom: 4,
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 6,
+                  }}
+                >
+                  <span>{p.created_at}</span>
+                  {!p.has_response && (
+                    <span
+                      title="응답 저장 안 됨"
+                      style={{
+                        display: "inline-flex",
+                        alignItems: "center",
+                        gap: 3,
+                        padding: "1px 6px",
+                        background: "#fff1f0",
+                        color: "#c0392b",
+                        border: "1px solid #f5c6c0",
+                        borderRadius: 8,
+                        fontSize: 10,
+                        lineHeight: 1.4,
+                      }}
+                    >
+                      <span
+                        style={{
+                          width: 5,
+                          height: 5,
+                          borderRadius: "50%",
+                          background: "#c0392b",
+                          display: "inline-block",
+                        }}
+                      />
+                      응답 없음
+                    </span>
+                  )}
+                </div>
+                <div
+                  style={{
+                    whiteSpace: "nowrap",
+                    overflow: "hidden",
+                    textOverflow: "ellipsis",
+                    fontSize: 13,
+                  }}
+                >
+                  {p.prompt.slice(0, 80)}
+                </div>
+              </div>
+            </li>
+          ))}
+          {prompts.length === 0 && (
+            <li style={{ padding: 16, color: "#888", fontSize: 13 }}>
+              표시할 프롬프트가 없습니다
+            </li>
+          )}
+        </ul>
+      </aside>
+
+      <main
+        style={{
+          flex: 1,
+          display: "flex",
+          flexDirection: "column",
+          padding: 20,
+          border: "1px solid #e5e5e5",
+          borderRadius: 8,
+          background: "#fff",
+          minWidth: 0,
+        }}
+      >
+        {selected ? (
+          <>
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 8,
+                marginBottom: 12,
+              }}
+            >
+              <button
+                onClick={() => toggleBookmark(selected)}
+                title={selected.bookmarked ? "북마크 해제" : "북마크"}
+                style={{
+                  border: "none",
+                  background: "transparent",
+                  cursor: "pointer",
+                  fontSize: 18,
+                  lineHeight: 1,
+                  padding: 0,
+                  color: selected.bookmarked ? "#f5a623" : "#ccc",
+                  flexShrink: 0,
+                }}
+              >
+                {selected.bookmarked ? "★" : "☆"}
+              </button>
+              <div
+                style={{
+                  fontSize: 12,
+                  color: "#666",
+                  wordBreak: "break-all",
+                  flex: 1,
+                  minWidth: 0,
+                }}
+              >
+                #{selected.id} · {selected.created_at} · {selected.cwd ?? ""}
+              </div>
+            </div>
+            <div
+              style={{
+                display: "flex",
+                flexWrap: "wrap",
+                gap: 6,
+                marginBottom: 12,
+                alignItems: "center",
+              }}
+            >
+              {selected.tags.map((t) => (
+                <span
+                  key={t}
+                  style={{
+                    display: "inline-flex",
+                    alignItems: "center",
+                    gap: 4,
+                    padding: "3px 8px",
+                    background: "#eef4ff",
+                    color: "#2556a0",
+                    border: "1px solid #d0dcf0",
+                    borderRadius: 12,
+                    fontSize: 11,
+                  }}
+                >
+                  #{t}
+                  <button
+                    onClick={() => removeTagFromSelected(t)}
+                    title="태그 삭제"
+                    style={{
+                      border: "none",
+                      background: "transparent",
+                      cursor: "pointer",
+                      color: "#6987bc",
+                      padding: 0,
+                      fontSize: 12,
+                      lineHeight: 1,
+                    }}
+                  >
+                    ×
+                  </button>
+                </span>
+              ))}
+              {tagInputVisible ? (
+                <input
+                  autoFocus
+                  value={tagInput}
+                  placeholder="태그 이름"
+                  onChange={(e) => setTagInput(e.target.value)}
+                  onBlur={() => {
+                    if (!tagInput.trim()) {
+                      setTagInputVisible(false);
+                    }
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") addTagToSelected();
+                    if (e.key === "Escape") {
+                      setTagInput("");
+                      setTagInputVisible(false);
+                    }
+                  }}
+                  style={{
+                    padding: "3px 8px",
+                    fontSize: 11,
+                    border: "1px solid #bbb",
+                    borderRadius: 12,
+                    outline: "none",
+                    minWidth: 100,
+                  }}
+                />
+              ) : (
+                <button
+                  onClick={() => setTagInputVisible(true)}
+                  title="태그 추가"
+                  style={{
+                    border: "1px dashed #bbb",
+                    background: "transparent",
+                    cursor: "pointer",
+                    color: "#888",
+                    padding: "3px 8px",
+                    borderRadius: 12,
+                    fontSize: 11,
+                  }}
+                >
+                  + 태그
+                </button>
+              )}
+            </div>
+            <div
+              style={{
+                display: "flex",
+                flexDirection: "column",
+                flex: 1,
+                minHeight: 0,
+                gap: 16,
+              }}
+            >
+              <section
+                style={{
+                  display: "flex",
+                  flexDirection: "column",
+                  flex: 1,
+                  minHeight: 0,
+                }}
+              >
+                <div style={{ fontSize: 12, fontWeight: 600, color: "#555", marginBottom: 6 }}>
+                  프롬프트
+                </div>
+                <textarea
+                  value={draft}
+                  onChange={(e) => setDraft(e.target.value)}
+                  style={{
+                    flex: 1,
+                    fontFamily: "ui-monospace, monospace",
+                    fontSize: 14,
+                    padding: 14,
+                    border: "1px solid #e0e0e0",
+                    borderRadius: 6,
+                    resize: "none",
+                  }}
+                />
+                <div style={{ display: "flex", gap: 10, marginTop: 10, alignItems: "center" }}>
+                  <button onClick={copy}>복사</button>
+                  <button onClick={save}>저장</button>
+                  {confirmingDelete ? (
+                    <div
+                      style={{
+                        marginLeft: "auto",
+                        display: "flex",
+                        gap: 8,
+                        alignItems: "center",
+                      }}
+                    >
+                      <span style={{ fontSize: 12, color: "#c00" }}>삭제할까요?</span>
+                      <button
+                        onClick={remove}
+                        style={{
+                          color: "#fff",
+                          background: "#c00",
+                          border: "none",
+                          borderRadius: 4,
+                          padding: "4px 12px",
+                          cursor: "pointer",
+                        }}
+                      >
+                        삭제
+                      </button>
+                      <button onClick={() => setConfirmingDelete(false)}>취소</button>
+                    </div>
+                  ) : (
+                    <button
+                      onClick={() => setConfirmingDelete(true)}
+                      style={{ marginLeft: "auto", color: "#c00" }}
+                    >
+                      삭제
+                    </button>
+                  )}
+                </div>
+              </section>
+
+              <section
+                style={{
+                  display: "flex",
+                  flexDirection: "column",
+                  flex: 3,
+                  minHeight: 0,
+                }}
+              >
+                <div
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 8,
+                    marginBottom: 6,
+                  }}
+                >
+                  <div style={{ fontSize: 12, fontWeight: 600, color: "#555" }}>
+                    응답
+                  </div>
+                  {response && (
+                    <span style={{ fontSize: 11, color: "#888" }}>
+                      ({sourceLabel(response.source)}) · {response.fetched_at}
+                    </span>
+                  )}
+                  <button
+                    onClick={() => setResponseEditing((v) => !v)}
+                    disabled={responseLoading || !!responseError}
+                    style={{
+                      marginLeft: "auto",
+                      fontSize: 11,
+                      padding: "3px 10px",
+                      border: "1px solid #ddd",
+                      borderRadius: 4,
+                      background: responseEditing ? "#fff3cd" : "#fff",
+                      cursor: "pointer",
+                      color: responseEditing ? "#b58900" : "#555",
+                    }}
+                  >
+                    {responseEditing ? "보기" : "편집"}
+                  </button>
+                </div>
+                {responseLoading ? (
+                  <div
+                    style={{
+                      flex: 1,
+                      padding: 14,
+                      border: "1px solid #e0e0e0",
+                      borderRadius: 6,
+                      background: "#fafafa",
+                      color: "#888",
+                    }}
+                  >
+                    로딩 중...
+                  </div>
+                ) : responseError ? (
+                  <div
+                    style={{
+                      flex: 1,
+                      padding: 14,
+                      border: "1px solid #e0e0e0",
+                      borderRadius: 6,
+                      background: "#fff5f5",
+                      color: "#900",
+                      fontSize: 13,
+                      whiteSpace: "pre-wrap",
+                    }}
+                  >
+                    {responseError}
+                  </div>
+                ) : responseEditing ? (
+                  <textarea
+                    value={responseDraft}
+                    onChange={(e) => setResponseDraft(e.target.value)}
+                    style={{
+                      flex: 1,
+                      fontFamily: "ui-monospace, monospace",
+                      fontSize: 13,
+                      padding: 14,
+                      border: "1px solid #e0e0e0",
+                      borderRadius: 6,
+                      resize: "none",
+                      background: "#fafafa",
+                    }}
+                  />
+                ) : (
+                  <div
+                    className="markdown-body"
+                    style={{
+                      flex: 1,
+                      padding: "14px 18px",
+                      border: "1px solid #e0e0e0",
+                      borderRadius: 6,
+                      background: "#fff",
+                      overflowY: "auto",
+                      fontSize: 13,
+                      lineHeight: 1.6,
+                      color: "#222",
+                    }}
+                  >
+                    {responseDraft ? (
+                      <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                        {responseDraft}
+                      </ReactMarkdown>
+                    ) : (
+                      <div style={{ color: "#aaa" }}>(응답 없음)</div>
+                    )}
+                  </div>
+                )}
+                <div style={{ display: "flex", gap: 10, marginTop: 10 }}>
+                  <button onClick={copyResponse} disabled={!responseDraft}>
+                    복사
+                  </button>
+                  <button
+                    onClick={saveResponseToPrompt}
+                    disabled={!responseDraft || responseLoading}
+                  >
+                    저장
+                  </button>
+                  <button
+                    onClick={refreshResponse}
+                    disabled={responseLoading}
+                    style={{ marginLeft: "auto" }}
+                  >
+                    ↻ 다시 가져오기
+                  </button>
+                </div>
+              </section>
+            </div>
+          </>
+        ) : (
+          <div style={{ color: "#888", margin: "auto" }}>
+            왼쪽에서 프롬프트를 선택하세요
+          </div>
+        )}
+        {toast && (
+          <div
+            style={{
+              position: "fixed",
+              bottom: 28,
+              right: 28,
+              background: "#333",
+              color: "#fff",
+              padding: "10px 16px",
+              borderRadius: 6,
+              fontSize: 13,
+            }}
+          >
+            {toast}
+          </div>
+        )}
+      </main>
+    </div>
+  );
+}
