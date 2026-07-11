@@ -1,5 +1,7 @@
 # Recall
 
+**English** · [한국어](README.ko.md)
+
 **A local-first desktop app for browsing your Claude Code prompt history.**
 
 Claude Code doesn't keep a searchable record of what you've asked it. The good prompt you wrote three weeks ago — the one that finally got the refactor right — is buried somewhere in a session transcript you'll never find again.
