@@ -1,3 +1,5 @@
+pub mod ingest;
+
 use rusqlite::types::Value;
 use rusqlite::{params, params_from_iter, Connection, OpenFlags, OptionalExtension};
 use serde::Serialize;
@@ -15,6 +17,8 @@ struct Prompt {
     bookmarked: bool,
     tags: Vec<String>,
     has_response: bool,
+    /// 'human' | 'system'(주입 이벤트) | null(아직 수집 안 됨)
+    kind: Option<String>,
 }
 
 #[derive(Serialize, Debug)]
@@ -151,6 +155,10 @@ fn ensure_aux_tables(conn: &Connection) -> Result<(), String> {
     // prompts 테이블에 transcript user 이벤트의 uuid 캐시 컬럼.
     // (log_prompt.py 가 만든 외부 테이블이라 여기서 방어적으로 추가; 이미 있으면 무시)
     let _ = conn.execute("ALTER TABLE prompts ADD COLUMN msg_uuid TEXT", []);
+
+    // 세그먼트 스키마도 여기서 보장한다. 테이블이 항상 존재하면 "있으면 이 SQL, 없으면 저 SQL"
+    // 같은 분기가 사라지고, 분기가 없으면 두 갈래가 어긋날 일도 없다.
+    ingest::ensure_schema(conn)?;
 
     Ok(())
 }
@@ -528,6 +536,7 @@ fn row_to_prompt(row: &rusqlite::Row) -> rusqlite::Result<Prompt> {
         bookmarked: bookmarked.is_some(),
         tags,
         has_response: has_response != 0,
+        kind: row.get(8)?,
     })
 }
 
@@ -552,17 +561,25 @@ fn list_prompts(
     tag: Option<String>,
     date_from: Option<String>,
     date_to: Option<String>,
+    include_system: Option<bool>,
 ) -> Result<Vec<Prompt>, String> {
     let conn = open_conn()?;
 
     let mut sql = String::from(SESSION_FIRST_CTE);
+    // has_response: 응답이 있다는 것은 이제 두 가지를 뜻한다 —
+    // 레거시 `response` 텍스트가 있거나, **세그먼트로 수집됐거나.**
+    // 이 술어를 안 고치면 완전본으로 수집된 프롬프트가 전부 "응답 없음" 으로 보이고,
+    // 삭제 후보로도 잡힌다(그건 Stage 0 에서 이미 막았다).
     sql.push_str(
         " SELECT p.id, p.session_id, p.cwd, p.prompt, p.created_at, b.prompt_id,
                  (SELECT GROUP_CONCAT(t.name, char(1))
                   FROM prompt_tags pt
                   JOIN tags t ON t.id = pt.tag_id
                   WHERE pt.prompt_id = p.id) AS tags,
-                 (CASE WHEN p.response IS NOT NULL AND p.response <> '' THEN 1 ELSE 0 END) AS has_response
+                 (CASE WHEN (p.response IS NOT NULL AND p.response <> '')
+                         OR EXISTS (SELECT 1 FROM turn_segments s WHERE s.prompt_id = p.id)
+                       THEN 1 ELSE 0 END) AS has_response,
+                 p.kind
           FROM prompts p
           LEFT JOIN session_first sf ON sf.session_id = p.session_id
           LEFT JOIN prompt_bookmarks b ON b.prompt_id = p.id
@@ -570,8 +587,25 @@ fn list_prompts(
     );
     let mut bind: Vec<Value> = Vec::new();
 
+    // task-notification 같은 주입 이벤트도 훅을 발생시켜 행을 만든다(382개).
+    // 그 내용은 원래 프롬프트의 응답 안에 접혀 있으므로 목록에서는 기본으로 숨긴다.
+    // 지우지는 않는다 — 토글로 볼 수 있다.
+    //
+    // 단, **북마크나 태그가 달린 것은 숨기지 않는다.** 사용자가 명시적으로 아낀다고 표시한
+    // 것을 앱이 임의로 감추면 안 된다. 실제로 그런 행이 있다(id 4668 은 북마크된
+    // <task-notification> 이다) — 이 예외가 없으면 그 북마크가 목록에서 사라진다.
+    if !include_system.unwrap_or(false) {
+        sql.push_str(
+            " AND (p.kind IS NULL OR p.kind <> 'system'
+                   OR b.prompt_id IS NOT NULL
+                   OR EXISTS (SELECT 1 FROM prompt_tags t WHERE t.prompt_id = p.id))",
+        );
+    }
+
     if let Some(q) = search.as_deref().filter(|s| !s.is_empty()) {
-        sql.push_str(" AND p.prompt LIKE ?");
+        // 산문(narrative)까지 검색한다. 도구 덤프는 제외되므로 노이즈가 없다.
+        sql.push_str(" AND (p.prompt LIKE ? OR p.narrative LIKE ?)");
+        bind.push(Value::Text(format!("%{}%", q)));
         bind.push(Value::Text(format!("%{}%", q)));
     }
     if let Some(c) = cwd.as_deref() {
@@ -1310,6 +1344,114 @@ fn toggle_bookmark(prompt_id: i64, bookmarked: bool) -> Result<bool, String> {
     Ok(bookmarked)
 }
 
+// ───────────────────────── 세그먼트 수집 / 조회 ─────────────────────────
+
+/// 응답 세그먼트의 **헤더만.** `body` 는 일부러 빼놨다.
+///
+/// 이게 렌더링 문제의 전부다. 실측: 프롬프트 5055 의 응답은 222,991 바이트 / 개행 62,941 개
+/// (yarn.lock diff) 라, react-markdown 이 ~94,000 개 노드를 만들어 앱을 1.1초 얼린다.
+/// SQLite 는 큰 BLOB 을 overflow page 에 두므로 **컬럼을 안 고르면 안 읽는다** —
+/// 최악의 턴도 2.5MB 대신 헤더 몇십 KB 만 넘어온다. 본문은 사용자가 펼칠 때만 가져온다.
+#[derive(Serialize, Debug)]
+struct SegmentHeader {
+    id: i64,
+    seq: i64,
+    kind: String,
+    name: Option<String>,
+    tool_id: Option<String>,
+    preview: String,
+    nbytes: i64,
+    nlines: i64,
+    is_error: bool,
+    /// 작은 산문은 헤더에 실어 보낸다 — 왕복을 아끼고, 대부분의 응답은 이걸로 끝난다.
+    body: Option<String>,
+}
+
+/// 이 크기까지는 헤더와 함께 보낸다. 넘으면 사용자가 펼칠 때 따로 가져온다.
+const INLINE_BODY_MAX_BYTES: i64 = 24_000;
+const INLINE_BODY_MAX_LINES: i64 = 400;
+
+#[tauri::command]
+fn list_segments(prompt_id: i64) -> Result<Vec<SegmentHeader>, String> {
+    let conn = open_conn()?;
+    if !has_segments_table(&conn) {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn
+        .prepare(
+            "SELECT s.id, s.seq, s.kind, s.name, s.tool_id, s.preview, s.nbytes, s.nlines, s.is_error,
+                    CASE WHEN s.kind = 'text' AND s.nbytes <= ?2 AND s.nlines <= ?3
+                         THEN COALESCE(e.body, s.body) ELSE NULL END AS inline_body
+             FROM turn_segments s
+             LEFT JOIN segment_edits e
+                    ON e.prompt_id = s.prompt_id AND e.src_uuid = s.src_uuid
+                   AND e.block_idx = s.block_idx
+             WHERE s.prompt_id = ?1
+             ORDER BY s.seq",
+        )
+        .map_err(|e| e.to_string())?;
+    let mapped = stmt
+        .query_map(
+            params![prompt_id, INLINE_BODY_MAX_BYTES, INLINE_BODY_MAX_LINES],
+            |r| {
+                Ok(SegmentHeader {
+                    id: r.get(0)?,
+                    seq: r.get(1)?,
+                    kind: r.get(2)?,
+                    name: r.get(3)?,
+                    tool_id: r.get(4)?,
+                    preview: r.get(5)?,
+                    nbytes: r.get(6)?,
+                    nlines: r.get(7)?,
+                    is_error: r.get::<_, i64>(8)? != 0,
+                    body: r.get(9)?,
+                })
+            },
+        )
+        .map_err(|e| e.to_string())?;
+    mapped.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+}
+
+/// 접힌 세그먼트를 펼칠 때만 본문을 가져온다.
+#[tauri::command]
+fn get_segment_body(segment_id: i64) -> Result<Option<String>, String> {
+    let conn = open_conn()?;
+    conn.query_row(
+        "SELECT COALESCE(e.body, s.body)
+         FROM turn_segments s
+         LEFT JOIN segment_edits e
+                ON e.prompt_id = s.prompt_id AND e.src_uuid = s.src_uuid
+               AND e.block_idx = s.block_idx
+         WHERE s.id = ?1",
+        params![segment_id],
+        |r| r.get(0),
+    )
+    .optional()
+    .map_err(|e| e.to_string())
+}
+
+/// 모든 세션을 다시 수집한다.
+///
+/// 매번 전체를 다시 읽는다. 391MB 를 몇 초에 훑으므로 바이트 커서가 필요 없고,
+/// 커서가 없으므로 "체크포인트를 EOF 로 잡아 이후 내용을 잃는" 실패 모드가 **존재하지 않는다.**
+/// `prompts.response` 는 이 경로에서 절대 쓰이지 않는다.
+pub fn run_ingest() -> Result<ingest::IngestStats, String> {
+    let mut conn = open_conn()?;
+    ingest::ensure_schema(&conn)?;
+    let offset = local_offset_seconds(&conn);
+    ingest::ingest_all(
+        &mut conn,
+        offset,
+        &parse_iso_to_epoch,
+        &|cwd: &str, sid: &str| find_jsonl(cwd, sid).or_else(|| Some(jsonl_path(cwd, sid))),
+    )
+}
+
+#[tauri::command(async)]
+fn ingest_all_sessions() -> Result<ingest::IngestStats, String> {
+    run_ingest()
+}
+
 /// rollback journal 모드에서는 쓰기 하나가 DB 전체를 잠근다. 훅과 앱이 함께 쓰는 이 DB 에선
 /// 그게 곧 프롬프트 행 유실이다. WAL 은 읽기와 쓰기가 서로를 막지 않으므로 이 경합을 없앤다.
 ///
@@ -1363,7 +1505,10 @@ pub fn run() {
             toggle_bookmark,
             list_tags,
             add_prompt_tag,
-            remove_prompt_tag
+            remove_prompt_tag,
+            list_segments,
+            get_segment_body,
+            ingest_all_sessions
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -1452,18 +1597,11 @@ mod tests {
     /// **완벽하게 수집된 프롬프트가 전부 삭제 후보가 된다.**
     #[test]
     fn prompt_with_segments_is_never_a_candidate() {
-        let conn = test_db();
-        conn.execute_batch(
-            "CREATE TABLE turn_segments (
-                 id        INTEGER PRIMARY KEY,
-                 prompt_id INTEGER NOT NULL,
-                 kind      TEXT NOT NULL
-             );",
-        )
-        .unwrap();
+        let conn = test_db(); // ensure_aux_tables 가 turn_segments 를 만든다
         let id = insert_prompt(&conn, Some("no-such-session"), Some("/no/such/cwd"), 72);
         conn.execute(
-            "INSERT INTO turn_segments (prompt_id, kind) VALUES (?1, 'text')",
+            "INSERT INTO turn_segments (prompt_id, src_uuid, block_idx, seq, kind)
+             VALUES (?1, 'u1', 0, 0, 'text')",
             params![id],
         )
         .unwrap();

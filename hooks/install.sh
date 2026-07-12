@@ -35,9 +35,10 @@ fi
 ln -sfn "$REPO/hooks/log_prompt.py" "$TARGET"
 echo "  ✅ $TARGET → $(readlink "$TARGET")"
 
-# ── 2. 아카이버 launchd 등록 (매시간) ────────────────────────────────────
-# /usr/bin/python3 를 쓴다 — homebrew python 은 버전업 시 경로가 바뀔 수 있지만
-# 이건 macOS 와 함께 항상 존재한다. 스크립트는 표준 라이브러리만 쓴다.
+# ── 2. 스위퍼 launchd 등록 (매시간: 아카이브 + 수집) ────────────────────
+# 이게 응답 수집의 **유일한** 자동 경로다. Stop 훅은 만들지 않는다 —
+# 실측상 중단된 턴 9.9% 에서 발생하지 않아 어차피 스위퍼가 필요하고,
+# 스위퍼가 있으면 훅이 사는 건 지연시간뿐인데 그 대가가 Claude Code 의 매 턴이다.
 cat > "$PLIST" <<PLIST_EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -46,8 +47,8 @@ cat > "$PLIST" <<PLIST_EOF
   <key>Label</key><string>com.recall.archive</string>
   <key>ProgramArguments</key>
   <array>
-    <string>/usr/bin/python3</string>
-    <string>$REPO/hooks/archive_transcripts.py</string>
+    <string>/bin/bash</string>
+    <string>$REPO/hooks/sweep.sh</string>
   </array>
   <key>StartInterval</key><integer>3600</integer>
   <key>RunAtLoad</key><true/>
