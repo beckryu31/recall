@@ -704,26 +704,45 @@ fn set_cwd_alias(cwd: String, alias: String) -> Result<(), String> {
     Ok(())
 }
 
-fn save_to_prompts_response(
+/// prompts.response 를 **비어 있을 때만** 채운다. 이미 바이트가 있으면 건드리지 않는다.
+///
+/// prompts.response 는 프롬프트 3,026개(61%)에게 지구상 유일한 사본이고, 동시에 사람이
+/// 손으로 고칠 수 있는 컬럼이다. "새로 추출한 것이 저장된 것보다 낫다" 고 자동으로 판단하는
+/// 코드 경로는 존재해선 안 된다 — 438개가 사라진 사고와 정확히 같은 모양이다.
+///
+/// 덮어쓰기가 허용되는 곳은 둘뿐이고, 둘 다 사람이 명시적으로 요청한 것이다:
+///   - `save_response`         — 사람이 [저장] 을 눌렀다
+///   - `refetch_all_responses` — 백업이 성공했고 확인 다이얼로그를 통과했다
+///
+/// 반환하는 bool 은 **실제로 썼는지** 다. 호출측은 이것으로 "저장됨" 과 "읽었지만 저장 안 됨" 을
+/// 구별해 사용자에게 알려야 한다. 화면엔 새 텍스트를 보여주면서 DB 엔 옛 것이 남아 있는데
+/// "저장됨" 이라고 말하면 그 UI 는 거짓말을 하는 것이다.
+fn fill_response_if_empty(
     conn: &Connection,
     prompt_id: i64,
     response: &str,
-) -> Result<String, String> {
-    conn.execute(
-        "UPDATE prompts SET response = ?1 WHERE id = ?2",
-        params![response, prompt_id],
-    )
-    .map_err(|e| e.to_string())?;
-    conn.query_row("SELECT datetime('now')", [], |row| row.get::<_, String>(0))
-        .map_err(|e| e.to_string())
+) -> Result<(String, bool), String> {
+    let written = conn
+        .execute(
+            "UPDATE prompts SET response = ?1
+             WHERE id = ?2 AND (response IS NULL OR response = '')",
+            params![response, prompt_id],
+        )
+        .map_err(|e| e.to_string())?;
+    let now = conn
+        .query_row("SELECT datetime('now')", [], |row| row.get::<_, String>(0))
+        .map_err(|e| e.to_string())?;
+    Ok((now, written > 0))
 }
 
-/// JSONL에서 해당 프롬프트의 응답을 추출해 prompts.response 에 저장한다.
-/// 성공 시 (응답 본문, fetched_at) 을 반환하고, 응답을 찾지 못하면 Ok(None) 을 반환한다.
-fn fetch_response_from_jsonl_and_save(
+/// JSONL 에서 해당 프롬프트의 응답을 추출하고, prompts.response 가 비어 있으면 채운다.
+/// 성공 시 (응답 본문, fetched_at, 저장했는지) 를, 응답을 찾지 못하면 Ok(None) 을 반환한다.
+///
+/// 이미 응답이 저장돼 있으면 **추출만 하고 쓰지 않는다** (`fill_response_if_empty` 참조).
+fn fetch_response_from_jsonl_and_fill(
     conn: &Connection,
     prompt_id: i64,
-) -> Result<Option<(String, String)>, String> {
+) -> Result<Option<(String, String, bool)>, String> {
     let (session_id, cwd, prompt_text, created_at, msg_uuid): (
         Option<String>,
         Option<String>,
@@ -798,8 +817,8 @@ fn fetch_response_from_jsonl_and_save(
         );
     }
 
-    let fetched_at = save_to_prompts_response(conn, prompt_id, &response)?;
-    Ok(Some((response, fetched_at)))
+    let (fetched_at, saved) = fill_response_if_empty(conn, prompt_id, &response)?;
+    Ok(Some((response, fetched_at, saved)))
 }
 
 #[tauri::command]
@@ -836,7 +855,7 @@ fn get_response(
             .optional()
             .map_err(|e| e.to_string())?;
         if let Some(response) = cached {
-            let fetched_at = save_to_prompts_response(&conn, prompt_id, &response)?;
+            let (fetched_at, _) = fill_response_if_empty(&conn, prompt_id, &response)?;
             return Ok(Some(PromptResponse {
                 response,
                 fetched_at,
@@ -845,43 +864,55 @@ fn get_response(
         }
     }
 
-    match fetch_response_from_jsonl_and_save(&conn, prompt_id)? {
-        Some((response, fetched_at)) => Ok(Some(PromptResponse {
+    // refresh=true (↻ 다시 가져오기) 로 여기 오면, 저장된 응답이 있어도 새로 추출한다.
+    // 그러나 **쓰지는 않는다** — 저장된 바이트를 이기는 자동 판단은 하지 않는다.
+    // 그때는 source="jsonl" 로 돌려보내 화면이 "저장 안 됨" 이라고 말하게 하고,
+    // 커밋 여부는 사람이 [저장] 으로 결정한다.
+    match fetch_response_from_jsonl_and_fill(&conn, prompt_id)? {
+        Some((response, fetched_at, saved)) => Ok(Some(PromptResponse {
             response,
             fetched_at,
-            source: "saved".into(),
+            source: if saved { "saved".into() } else { "jsonl".into() },
         })),
         None => Ok(None),
     }
 }
 
-/// 최근 24시간(로컬 시간 기준) 내에 생성된 모든 프롬프트의 응답을
-/// JSONL 에서 다시 읽어와 저장(갱신)한다.
+/// 최근 24시간(로컬 시간 기준) 안에 생성됐고 **응답이 아직 비어 있는** 프롬프트의 id.
+///
+/// `response IS NULL OR response = ''` 가 이 술어의 전부다. 이게 없으면 `⤓ 24h` 가
+/// 하루치 응답을 통째로 다시 추출해 덮어쓴다 — 사람이 손으로 고친 것까지.
+/// `fill_response_if_empty` 가 어차피 한 번 더 막지만, 여기서 거르지 않으면
+/// 이미 채워진 수천 행의 transcript 를 헛되이 다시 파싱한다.
+fn recent_unfilled_ids(conn: &Connection) -> Result<Vec<i64>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id FROM prompts
+             WHERE datetime(created_at) >= datetime('now', '-24 hours', 'localtime')
+               AND (response IS NULL OR response = '')
+             ORDER BY id DESC",
+        )
+        .map_err(|e| e.to_string())?;
+    let mapped = stmt
+        .query_map([], |row| row.get(0))
+        .map_err(|e| e.to_string())?;
+    mapped
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())
+}
+
+/// 최근 24시간 내에 생성됐지만 아직 응답이 비어 있는 프롬프트를 JSONL 에서 채운다.
+/// **이미 저장된 응답은 건드리지 않는다** — 채우기이지 갱신이 아니다.
 #[tauri::command]
 fn fetch_recent_responses() -> Result<BatchFetchResult, String> {
     let conn = open_conn()?;
-
-    let ids: Vec<i64> = {
-        let mut stmt = conn
-            .prepare(
-                "SELECT id FROM prompts
-                 WHERE datetime(created_at) >= datetime('now', '-24 hours', 'localtime')
-                 ORDER BY id DESC",
-            )
-            .map_err(|e| e.to_string())?;
-        let mapped = stmt
-            .query_map([], |row| row.get(0))
-            .map_err(|e| e.to_string())?;
-        mapped
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?
-    };
+    let ids = recent_unfilled_ids(&conn)?;
 
     let mut fetched = 0;
     let mut not_found = 0;
     let mut failed = 0;
     for id in &ids {
-        match fetch_response_from_jsonl_and_save(&conn, *id) {
+        match fetch_response_from_jsonl_and_fill(&conn, *id) {
             Ok(Some(_)) => fetched += 1,
             Ok(None) => not_found += 1,
             Err(_) => failed += 1,
@@ -1144,7 +1175,9 @@ fn scan_unanswered(conn: &Connection) -> Result<PurgeScan, String> {
     let mut unknown = 0;
     let mut candidates = Vec::new();
     for id in &ids {
-        match fetch_response_from_jsonl_and_save(conn, *id) {
+        // 여기 오는 행은 no_response 술어로 골랐으므로 response 가 비어 있다.
+        // 따라서 채우기-전용 가드가 있어도 항상 쓰기가 일어나고, 아래 판정은 그대로 유지된다.
+        match fetch_response_from_jsonl_and_fill(conn, *id) {
             // 세션 기록에서 응답을 되살렸다. 삭제 후보가 아니다.
             Ok(Some(_)) => {
                 recovered += 1;
@@ -1737,6 +1770,80 @@ mod tests {
         );
         assert!(scan.candidates.is_empty());
         assert_eq!(scan.unknown, 0);
+    }
+
+    fn response_of(conn: &Connection, id: i64) -> Option<String> {
+        conn.query_row("SELECT response FROM prompts WHERE id = ?1", params![id], |r| {
+            r.get(0)
+        })
+        .unwrap()
+    }
+
+    /// prompts.response 는 3,026개 프롬프트에게 유일한 사본이고 사람이 손으로 고치는 컬럼이다.
+    /// 자동 추출이 이미 저장된 바이트를 덮어쓰는 경로는 존재해선 안 된다.
+    #[test]
+    fn fill_never_overwrites_an_existing_response() {
+        let conn = test_db();
+        let id = insert_prompt(&conn, Some("s"), Some("/c"), 2);
+        conn.execute(
+            "UPDATE prompts SET response = '사람이 손으로 고친 응답' WHERE id = ?1",
+            params![id],
+        )
+        .unwrap();
+
+        let (_, written) = fill_response_if_empty(&conn, id, "자동 추출기가 새로 뽑은 응답").unwrap();
+
+        assert!(!written, "이미 응답이 있는 행에 자동 추출이 썼다");
+        assert_eq!(
+            response_of(&conn, id).as_deref(),
+            Some("사람이 손으로 고친 응답"),
+            "사람이 쓴 바이트가 자동 추출로 덮였다 — 438 사고와 같은 모양"
+        );
+    }
+
+    /// 반대로, 비어 있으면 반드시 채워야 한다. 이게 신규 프롬프트의 response 를 채우는
+    /// 유일한 메커니즘이다 — 막히면 복사·저장·편집 버튼이 영구히 회색이 된다.
+    #[test]
+    fn fill_writes_when_response_is_empty() {
+        let conn = test_db();
+        let null_id = insert_prompt(&conn, Some("s"), Some("/c"), 2); // response = NULL
+        let empty_id = insert_prompt(&conn, Some("s"), Some("/c"), 2);
+        conn.execute(
+            "UPDATE prompts SET response = '' WHERE id = ?1",
+            params![empty_id],
+        )
+        .unwrap();
+
+        for id in [null_id, empty_id] {
+            let (_, written) = fill_response_if_empty(&conn, id, "추출된 응답").unwrap();
+            assert!(written, "비어 있는 응답(id={})을 채우지 않았다", id);
+            assert_eq!(response_of(&conn, id).as_deref(), Some("추출된 응답"));
+        }
+    }
+
+    /// `⤓ 24h` 가 고르는 대상. 응답이 이미 있는 행은 후보에 **들어오지도 않아야** 한다.
+    /// 이 술어가 없던 동안 이 버튼은 하루치 응답을 통째로 다시 추출해 덮어썼다 —
+    /// 백업도, 확인 다이얼로그도 없이.
+    #[test]
+    fn recent_batch_skips_rows_that_already_have_a_response() {
+        let conn = test_db();
+        let empty = insert_prompt(&conn, Some("s"), Some("/c"), 2);
+        let filled = insert_prompt(&conn, Some("s"), Some("/c"), 2);
+        let old_empty = insert_prompt(&conn, Some("s"), Some("/c"), 48);
+        conn.execute(
+            "UPDATE prompts SET response = '이미 저장된 응답' WHERE id = ?1",
+            params![filled],
+        )
+        .unwrap();
+
+        let ids = recent_unfilled_ids(&conn).unwrap();
+
+        assert!(ids.contains(&empty), "비어 있는 최근 행을 놓쳤다");
+        assert!(
+            !ids.contains(&filled),
+            "이미 응답이 있는 행이 ⤓24h 의 덮어쓰기 대상에 들어갔다"
+        );
+        assert!(!ids.contains(&old_empty), "24시간 밖의 행이 들어왔다");
     }
 
     /// 북마크가 달린 프롬프트는 검사조차 하지 않는다.

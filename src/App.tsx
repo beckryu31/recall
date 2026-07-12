@@ -100,7 +100,9 @@ type DeleteResult = {
 const sourceLabel = (s: PromptResponse["source"]) => {
   if (s === "saved") return "저장됨";
   if (s === "cache") return "캐시됨";
-  return "JSONL에서 가져옴";
+  // "jsonl" = 세션 기록에서 방금 읽었지만 **쓰지 않았다.** 이미 저장된 응답이 있어서다.
+  // 저장된 바이트를 이기는 자동 판단은 하지 않는다 — 커밋은 [저장] 으로 사람이 한다.
+  return "세션 기록에서 읽음 · 저장 안 됨";
 };
 
 /// 원형 되돌리기 화살표. 유니코드 ⟳ 는 폰트가 크기·두께를 정해버려 작게 나오므로 직접 그린다.
@@ -371,9 +373,12 @@ export default function App() {
     try {
       const r = await invoke<BatchFetchResult>("fetch_recent_responses");
       showReport(
-        `최근 24시간 · 대상 ${r.total}개 중 ${r.fetched}개 응답을 가져왔습니다.` +
-          (r.not_found ? ` 응답을 찾지 못함 ${r.not_found}개.` : "") +
-          (r.failed ? ` 세션 기록이 없어 건너뜀 ${r.failed}개.` : "")
+        r.total === 0
+          ? "최근 24시간 안에 응답이 비어 있는 프롬프트가 없습니다."
+          : `최근 24시간 · 응답이 비어 있던 ${r.total}개 중 ${r.fetched}개를 채웠습니다. ` +
+              `이미 저장된 응답은 건드리지 않았습니다.` +
+              (r.not_found ? ` 응답을 찾지 못함 ${r.not_found}개.` : "") +
+              (r.failed ? ` 세션 기록이 없어 건너뜀 ${r.failed}개.` : "")
       );
       await loadPrompts();
       if (selected) await loadResponse(selected.id);
@@ -1181,7 +1186,7 @@ export default function App() {
           <button
             onClick={fetchRecentResponses}
             disabled={batchLoading}
-            title="최근 24시간 내 모든 프롬프트의 응답을 가져와 갱신"
+            title="최근 24시간 중 응답이 아직 비어 있는 프롬프트만 세션 기록에서 채웁니다. 이미 저장된 응답은 덮어쓰지 않습니다."
             style={{
               padding: "8px 10px",
               border: "1px solid #ddd",
@@ -1722,7 +1727,13 @@ export default function App() {
                     응답
                   </div>
                   {response && (
-                    <span style={{ fontSize: 11, color: "#888" }}>
+                    <span
+                      style={{
+                        fontSize: 11,
+                        // 저장 안 된 상태는 회색 속삭임으로 흘리면 안 된다. 오류는 아니므로 경보색도 아니다.
+                        color: response.source === "jsonl" ? "#b26a00" : "#888",
+                      }}
+                    >
                       ({sourceLabel(response.source)}) · {response.fetched_at}
                     </span>
                   )}
@@ -1863,6 +1874,7 @@ export default function App() {
                   <button
                     onClick={refreshResponse}
                     disabled={responseLoading}
+                    title="세션 기록에서 응답을 다시 읽어 보여줍니다. 이미 저장된 응답이 있으면 덮어쓰지 않고 화면에만 띄우므로, 마음에 들면 [저장] 을 누르세요. 프롬프트를 다시 클릭하면 저장된 응답으로 되돌아갑니다."
                     style={{ marginLeft: "auto" }}
                   >
                     ↻ 다시 가져오기
