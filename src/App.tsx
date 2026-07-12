@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { getVersion } from "@tauri-apps/api/app";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
@@ -14,6 +14,8 @@ type Prompt = {
   bookmarked: boolean;
   tags: string[];
   has_response: boolean;
+  /// 'human' | 'system'(주입 이벤트) | null(아직 수집 안 됨)
+  kind: string | null;
 };
 
 type CwdGroup = {
@@ -47,10 +49,40 @@ type PurgeCandidate = {
   cwd: string | null;
 };
 
+type Segment = {
+  id: number;
+  seq: number;
+  kind: "text" | "tool_use" | "tool_result" | "injected" | "interrupt" | "image";
+  name: string | null;
+  tool_id: string | null;
+  preview: string;
+  nbytes: number;
+  nlines: number;
+  is_error: boolean;
+  /// 작은 산문은 백엔드가 헤더에 실어 보낸다. 큰 것은 null 이고 펼칠 때 따로 가져온다.
+  body: string | null;
+};
+
+// 산문 캡. **바이트가 아니라 개행 수(≈ DOM 노드 수)** 로 건다.
+// 실측: 프롬프트 5055 의 응답은 222KB / 개행 62,941개(yarn.lock diff)라
+// react-markdown 이 ~94,000개 노드를 만들어 앱을 1.1초 얼린다.
+// 반면 도구 덤프는 최대 83KB 이고 <pre> 안에서는 노드 하나다 — 무해하다.
+// 캡을 바이트에 걸면 엉뚱한 축에 갑옷을 입히는 것이다.
+const PROSE_MAX_LINES = 800;
+const PROSE_MAX_BYTES = 32_000;
+
+type DbHead = {
+  max_prompt_id: number;
+  max_segment_id: number;
+  pending: number;
+};
+
 type PurgeScan = {
   scanned: number;
   recovered: number;
   protected: number;
+  /// 세션 기록이 없어 판단 자체가 불가능했던 것. 삭제 후보가 아니다.
+  unknown: number;
   candidates: PurgeCandidate[];
 };
 
@@ -97,6 +129,171 @@ const displayName = (g: CwdGroup) => {
   return shortenCwd(g.cwd);
 };
 
+function humanBytes(n: number) {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(0)} KB`;
+  return `${(n / 1024 / 1024).toFixed(1)} MB`;
+}
+
+// min-width: 0 이 핵심이다. flex 자식의 기본값은 min-width:auto 라서,
+// 줄바꿈 없는 27,000자짜리 한 줄이 레이아웃 전체를 밀어낸다.
+const PRE: React.CSSProperties = {
+  whiteSpace: "pre-wrap",
+  overflowWrap: "anywhere",
+  overflowX: "auto",
+  minWidth: 0,
+  margin: 0,
+  padding: "8px 10px",
+  background: "#f7f7f8",
+  border: "1px solid #eee",
+  borderRadius: 4,
+  fontSize: 12,
+  fontFamily: "ui-monospace, monospace",
+  maxHeight: 420,
+  overflowY: "auto",
+};
+
+/** 도구 호출·도구 결과·주입 이벤트. 기본으로 접혀 있고, 펼칠 때만 본문을 가져온다. */
+function FoldedSegment({
+  s,
+  defaultOpen = false,
+  label: labelOverride,
+}: {
+  s: Segment;
+  defaultOpen?: boolean;
+  label?: string;
+}) {
+  const [open, setOpen] = useState(defaultOpen);
+  const [body, setBody] = useState<string | null>(s.body);
+  const [loading, setLoading] = useState(false);
+
+  const fetchBody = async () => {
+    if (body !== null || loading) return;
+    setLoading(true);
+    try {
+      setBody(await invoke<string | null>("get_segment_body", { segmentId: s.id }));
+    } catch (e) {
+      setBody(String(e));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // 열린 채로 시작하면(긴 산문) 즉시 본문을 가져온다.
+  useEffect(() => {
+    if (open) fetchBody();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open]);
+
+  const label =
+    labelOverride ??
+    (s.kind === "tool_use"
+      ? s.preview
+      : s.kind === "tool_result"
+      ? `결과${s.is_error ? " (오류)" : ""}`
+      : s.name === "task-notification"
+      ? "백그라운드 작업 알림"
+      : s.name === "command"
+      ? "커맨드"
+      : s.name === "bash"
+      ? "bash"
+      : "주입된 컨텍스트");
+
+  const tint = s.is_error ? "#c33" : s.kind === "tool_use" ? "#2556a0" : "#777";
+
+  return (
+    <div style={{ margin: "6px 0", minWidth: 0 }}>
+      <button
+        onClick={() => setOpen((o) => !o)}
+        style={{
+          display: "flex",
+          alignItems: "center",
+          gap: 6,
+          width: "100%",
+          textAlign: "left",
+          background: "none",
+          border: "none",
+          padding: "3px 0",
+          cursor: "pointer",
+          fontSize: 12,
+          color: tint,
+          fontFamily: "ui-monospace, monospace",
+          minWidth: 0,
+        }}
+      >
+        <span style={{ opacity: 0.5 }}>{open ? "▾" : "▸"}</span>
+        <span
+          style={{
+            overflow: "hidden",
+            textOverflow: "ellipsis",
+            whiteSpace: "nowrap",
+            flex: 1,
+            minWidth: 0,
+          }}
+        >
+          {label}
+        </span>
+        <span style={{ color: "#bbb", flexShrink: 0 }}>{humanBytes(s.nbytes)}</span>
+      </button>
+      {open && (
+        <pre style={PRE}>{loading ? "…" : body ?? "(본문 없음)"}</pre>
+      )}
+    </div>
+  );
+}
+
+/** 응답 하나 = 세그먼트 시퀀스. 이게 곧 "접어넣기" 의 결과물이다. */
+function SegmentView({ segments }: { segments: Segment[] }) {
+  return (
+    <div style={{ minWidth: 0 }}>
+      {segments.map((s) => {
+        if (s.kind === "interrupt") {
+          return (
+            <div
+              key={s.id}
+              style={{
+                margin: "10px 0",
+                paddingLeft: 10,
+                borderLeft: "2px solid #e0b0b0",
+                color: "#a55",
+                fontSize: 12,
+              }}
+            >
+              사용자가 중단함
+            </div>
+          );
+        }
+        if (s.kind === "image") {
+          return (
+            <div key={s.id} style={{ color: "#999", fontSize: 12, margin: "6px 0" }}>
+              [이미지]
+            </div>
+          );
+        }
+        if (s.kind !== "text") return <FoldedSegment key={s.id} s={s} />;
+
+        // 산문. 노드 수가 폭발할 것 같으면 markdown 을 아예 태우지 않는다.
+        // <pre> 는 텍스트 노드 하나라서 220KB 도 즉시 뜬다. markdown 은 94,000 노드를 만든다.
+        if (s.nlines > PROSE_MAX_LINES || s.nbytes > PROSE_MAX_BYTES) {
+          return (
+            <FoldedSegment
+              key={s.id}
+              s={s}
+              defaultOpen
+              label={`긴 텍스트 · ${s.nlines.toLocaleString()}줄 (원문으로 표시)`}
+            />
+          );
+        }
+        return (
+          <div key={s.id} className="markdown-body" style={{ minWidth: 0 }}>
+            <ReactMarkdown remarkPlugins={[remarkGfm]}>{s.body ?? ""}</ReactMarkdown>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 export default function App() {
   const [cwds, setCwds] = useState<CwdGroup[]>([]);
   const [cwdFilter, setCwdFilter] = useState<string>(ALL_KEY);
@@ -130,6 +327,13 @@ export default function App() {
   const [appVersion, setAppVersion] = useState("");
   const [refetchAllLoading, setRefetchAllLoading] = useState(false);
   const [confirmRefetchAll, setConfirmRefetchAll] = useState(false);
+  const [segments, setSegments] = useState<Segment[]>([]);
+  const [showLegacy, setShowLegacy] = useState(false);
+  const [ingesting, setIngesting] = useState(false);
+  const [pendingNew, setPendingNew] = useState(0);
+  const headRef = useRef<DbHead | null>(null);
+  const tickBusy = useRef(false);
+  const listRef = useRef<HTMLUListElement | null>(null);
 
   const loadCwds = async () => {
     try {
@@ -250,6 +454,8 @@ export default function App() {
         tag: tagFilter || null,
         dateFrom: dateFrom || null,
         dateTo: dateTo || null,
+        // task-notification 행은 내용이 원래 프롬프트에 접혀 있으므로 목록에서 숨긴다.
+        includeSystem: false,
       });
       setPrompts(rows);
       setError("");
@@ -280,6 +486,103 @@ export default function App() {
     loadPrompts();
   }, [search, cwdFilter, onlyBookmarked, tagFilter, dateFrom, dateTo]);
 
+  // ─────────────────────── 목록 자동 갱신 (P1) ───────────────────────
+  //
+  // 3초마다 db_head() 만 본다 — 인덱스 SELECT 세 개, 쓰기 없음.
+  // 값이 바뀌었을 때만 실제 목록을 다시 읽는다.
+  //
+  // deps 를 [] 로 두는 게 중요하다. selected/editing 을 deps 에 넣으면 프롬프트를 클릭할
+  // 때마다 인터벌이 파괴·재생성되고 tick 이 즉시 재발화한다. 대신 ref 로 읽는다.
+  const loadPromptsRef = useRef<() => Promise<void>>(async () => {});
+  const loadSegmentsRef = useRef<(id: number) => Promise<void>>(async () => {});
+  const selectedRef = useRef<Prompt | null>(null);
+  const editingRef = useRef(false);
+  // deps 없이 매 렌더마다 최신 클로저를 ref 에 꽂는다. tick 은 이걸 읽으므로
+  // 상태가 바뀌어도 인터벌을 재생성할 필요가 없다.
+  useEffect(() => {
+    loadPromptsRef.current = loadPrompts;
+    loadSegmentsRef.current = loadSegments;
+    selectedRef.current = selected;
+    editingRef.current = responseEditing;
+  });
+
+  useEffect(() => {
+    let stopped = false;
+    let timer: number | undefined;
+    let ticks = 0;
+
+    const tick = async () => {
+      if (stopped) return;
+      // 창이 안 보이면 아무것도 하지 않는다.
+      if (!document.hidden && !tickBusy.current) {
+        tickBusy.current = true;
+        try {
+          const h = await invoke<DbHead>("db_head");
+          const prev = headRef.current;
+          headRef.current = h;
+
+          if (prev) {
+            if (h.max_prompt_id !== prev.max_prompt_id) {
+              // ⚠️ 스크롤된 목록 위에 행을 끼워 넣으면 모든 행이 밀리고, 사용자의 다음 클릭이
+              // 엉뚱한 프롬프트를 선택한다. WKWebView 에는 CSS scroll anchoring 이 없다.
+              // 대신 알림 필을 띄우고, 누를 때 맨 위로 올린다.
+              if ((listRef.current?.scrollTop ?? 0) > 8) {
+                setPendingNew(h.max_prompt_id - prev.max_prompt_id);
+              } else {
+                await loadPromptsRef.current();
+              }
+            }
+            // 응답이 새로 수집됐다면 열려 있는 프롬프트를 다시 그린다.
+            // **편집 중이면 건드리지 않는다** — 사용자가 쓰고 있는 것을 덮어쓰면 안 된다.
+            const sel = selectedRef.current;
+            if (sel && h.max_segment_id !== prev.max_segment_id && !editingRef.current) {
+              await loadSegmentsRef.current(sel.id);
+            }
+          }
+
+          // 15초마다 수집을 시도한다. 조건 없이 불러도 된다 — ingest_pending 은 세션 기록의
+          // mtime 이 자란 세션만 실제로 읽으므로, 아무것도 안 바뀌었으면 쿼리 몇 개로 끝난다.
+          // (진행 중인 턴은 파일이 계속 자라므로 응답이 실시간으로 채워진다.)
+          ticks += 1;
+          if (ticks % 5 === 0) {
+            await invoke("ingest_pending");
+          }
+        } catch {
+          // 폴링 실패가 앱을 죽이면 안 된다. 다음 tick 에 다시 시도한다.
+        } finally {
+          tickBusy.current = false;
+        }
+      }
+      // setInterval 이 아니라 self-scheduling setTimeout — tick 이 3초보다 오래 걸려도
+      // 호출이 쌓이지 않는다.
+      timer = window.setTimeout(tick, 3000);
+    };
+
+    tick();
+
+    // alt-tab 으로 돌아오면 기다리지 않고 즉시 한 번.
+    const wake = () => {
+      if (!document.hidden && !tickBusy.current) {
+        window.clearTimeout(timer);
+        tick();
+      }
+    };
+    window.addEventListener("focus", wake);
+    document.addEventListener("visibilitychange", wake);
+    return () => {
+      stopped = true;
+      window.clearTimeout(timer);
+      window.removeEventListener("focus", wake);
+      document.removeEventListener("visibilitychange", wake);
+    };
+  }, []);
+
+  const showNewPrompts = async () => {
+    setPendingNew(0);
+    listRef.current?.scrollTo({ top: 0 });
+    await loadPrompts();
+  };
+
   const loadResponse = async (promptId: number, refresh = false) => {
     setResponseLoading(true);
     setResponseError("");
@@ -292,8 +595,9 @@ export default function App() {
       });
       setResponse(r);
       setResponseDraft(r?.response ?? "");
-      if (!r) setResponseError("이 프롬프트에 해당하는 응답을 찾을 수 없습니다");
-      else markHasResponse(promptId, true);
+      if (r) markHasResponse(promptId, true);
+      // 세그먼트가 있으면 레거시 response 가 비어 있어도 응답이 없는 게 아니다.
+      // (수집된 응답은 turn_segments 에 있고 prompts.response 는 동결이다.)
     } catch (e) {
       setResponseError(String(e));
     } finally {
@@ -325,6 +629,16 @@ export default function App() {
     markHasResponse(selected.id, !!responseDraft);
   };
 
+  // 세그먼트는 헤더만 가져온다. body 는 사용자가 펼칠 때 따로 — 그래서 2.5MB 응답도 즉시 뜬다.
+  const loadSegments = async (promptId: number) => {
+    try {
+      setSegments(await invoke<Segment[]>("list_segments", { promptId }));
+    } catch (e) {
+      setSegments([]);
+      setError(String(e));
+    }
+  };
+
   const select = (p: Prompt) => {
     setSelected(p);
     setDraft(p.prompt);
@@ -332,7 +646,42 @@ export default function App() {
     setTagInputVisible(false);
     setResponseEditing(false);
     setConfirmingDelete(false);
+    setSegments([]);
+    setShowLegacy(false);
     loadResponse(p.id);
+    loadSegments(p.id);
+  };
+
+  // 모든 세션을 다시 수집한다. 세그먼트만 만들 뿐 prompts.response 는 건드리지 않는다.
+  const ingestAll = async () => {
+    if (ingesting) return;
+    setIngesting(true);
+    try {
+      const r = await invoke<{
+        sessions: number;
+        sessions_missing: number;
+        prompts_matched: number;
+        prompts_unresolved: number;
+        segments: number;
+        folded: number;
+      }>("ingest_all_sessions");
+      showReport(
+        `세션 ${r.sessions}개에서 프롬프트 ${r.prompts_matched}개의 응답을 수집했습니다 ` +
+          `(세그먼트 ${r.segments.toLocaleString()}개, 접힌 알림 ${r.folded}개).` +
+          (r.sessions_missing
+            ? ` 세션 기록이 없어 건너뛴 세션 ${r.sessions_missing}개 — 저장돼 있던 응답은 그대로입니다.`
+            : "")
+      );
+      await loadPrompts();
+      if (selected) {
+        await loadSegments(selected.id);
+        await loadResponse(selected.id);
+      }
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setIngesting(false);
+    }
   };
 
   const refreshResponse = () => {
@@ -801,16 +1150,19 @@ export default function App() {
               {onlyBookmarked ? "★" : "☆"}
             </button>
           </div>
+          {/* 강등. 목록은 이제 3초마다 스스로 갱신되므로 누를 필요가 없다.
+              그래도 지우지는 않는다 — 자동화가 조용히 멈췄을 때의 탈출구다. */}
           <button
             onClick={refreshAll}
-            title="새로고침"
+            title="자동으로 갱신됩니다. 눌러서 즉시 갱신할 수도 있습니다."
             style={{
               padding: "8px 12px",
-              border: "1px solid #ddd",
+              border: "1px solid #eee",
               borderRadius: 6,
               background: "#fff",
               cursor: "pointer",
               fontSize: 14,
+              color: "#bbb",
             }}
           >
             ↻
@@ -831,6 +1183,23 @@ export default function App() {
             }}
           >
             {batchLoading ? "가져오는 중…" : "⤓ 24h"}
+          </button>
+          <button
+            onClick={ingestAll}
+            disabled={ingesting}
+            title="세션 기록에서 모든 응답을 세그먼트로 수집합니다. 도구 호출·결과·백그라운드 알림까지 원래 프롬프트 안으로 접어 넣습니다. 저장된 응답은 건드리지 않습니다."
+            style={{
+              padding: "8px 10px",
+              border: "1px solid #ddd",
+              borderRadius: 6,
+              background: ingesting ? "#eef" : "#fff",
+              cursor: ingesting ? "default" : "pointer",
+              fontSize: 12,
+              whiteSpace: "nowrap",
+              color: ingesting ? "#888" : "#2a7",
+            }}
+          >
+            {ingesting ? "수집 중…" : "⟳ 수집"}
           </button>
           {confirmRefetchAll ? (
             <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
@@ -988,7 +1357,27 @@ export default function App() {
             {error}
           </div>
         )}
+        {/* 스크롤된 상태에서 새 프롬프트가 들어오면 목록을 밀지 않고 여기로 알린다. */}
+        {pendingNew > 0 && (
+          <button
+            onClick={showNewPrompts}
+            style={{
+              margin: "0 10px 8px",
+              padding: "6px 12px",
+              border: "1px solid #cfe0f5",
+              borderRadius: 999,
+              background: "#eef5fd",
+              color: "#2556a0",
+              fontSize: 12,
+              cursor: "pointer",
+              alignSelf: "center",
+            }}
+          >
+            새 프롬프트 {pendingNew}개 ↑
+          </button>
+        )}
         <ul
+          ref={listRef}
           style={{
             listStyle: "none",
             margin: 0,
@@ -1388,7 +1777,6 @@ export default function App() {
                   />
                 ) : (
                   <div
-                    className="markdown-body"
                     style={{
                       flex: 1,
                       padding: "14px 18px",
@@ -1396,15 +1784,56 @@ export default function App() {
                       borderRadius: 6,
                       background: "#fff",
                       overflowY: "auto",
+                      overflowX: "hidden",
                       fontSize: 13,
                       lineHeight: 1.6,
                       color: "#222",
+                      minWidth: 0,
                     }}
                   >
-                    {responseDraft ? (
-                      <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                        {responseDraft}
-                      </ReactMarkdown>
+                    {segments.length > 0 ? (
+                      <>
+                        <SegmentView segments={segments} />
+                        {/* 옛 추출본은 지우지 않는다. 프롬프트 61%에게는 그게 유일한 사본이다.
+                            다만 세그먼트가 있으면 그쪽이 완결본이므로 조용히 접어 둔다. */}
+                        {responseDraft && (
+                          <div
+                            style={{
+                              marginTop: 18,
+                              paddingTop: 10,
+                              borderTop: "1px solid #f0f0f0",
+                            }}
+                          >
+                            <button
+                              onClick={() => setShowLegacy((v) => !v)}
+                              style={{
+                                border: "none",
+                                background: "none",
+                                color: "#aaa",
+                                cursor: "pointer",
+                                padding: 0,
+                                fontSize: 11,
+                              }}
+                            >
+                              {showLegacy ? "▾" : "▸"} 옛 추출본 (
+                              {humanBytes(responseDraft.length)})
+                            </button>
+                            {showLegacy && (
+                              <div className="markdown-body" style={{ marginTop: 8, minWidth: 0 }}>
+                                <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                                  {responseDraft}
+                                </ReactMarkdown>
+                              </div>
+                            )}
+                          </div>
+                        )}
+                      </>
+                    ) : responseDraft ? (
+                      <div className="markdown-body" style={{ minWidth: 0 }}>
+                        <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                          {responseDraft}
+                        </ReactMarkdown>
+                      </div>
                     ) : (
                       <div style={{ color: "#aaa" }}>(응답 없음)</div>
                     )}
@@ -1567,12 +1996,20 @@ export default function App() {
             </div>
 
             <div style={{ fontSize: 13, color: "#555", lineHeight: 1.7 }}>
-              응답이 비어 있던 <b>{purgeScan.scanned}개</b>를 검사했습니다.
+              48시간이 지났고 응답이 비어 있던 <b>{purgeScan.scanned}개</b>를
+              검사했습니다.
               <br />
               그중 <b style={{ color: "#2556a0" }}>
                 {purgeScan.recovered}개
               </b>{" "}
               는 세션 기록에서 응답을 되살렸습니다.
+              {purgeScan.unknown > 0 && (
+                <>
+                  <br />
+                  세션 기록이 없어 <b>{purgeScan.unknown}개</b>는 판단할 수
+                  없었습니다 — <b>삭제 대상이 아닙니다.</b>
+                </>
+              )}
               {purgeScan.protected > 0 && (
                 <>
                   <br />
@@ -1596,8 +2033,9 @@ export default function App() {
             ) : (
               <>
                 <div style={{ fontSize: 13, color: "#a33" }}>
-                  아래 <b>{purgeScan.candidates.length}개</b>는 응답을 되살리지
-                  못했습니다. 삭제하면 되돌릴 수 없습니다.
+                  아래 <b>{purgeScan.candidates.length}개</b>는 세션 기록을 찾아
+                  확인했지만 그 턴에 응답이 없었습니다. 삭제하면 되돌릴 수
+                  없습니다.
                 </div>
                 <div
                   style={{

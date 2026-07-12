@@ -1,10 +1,13 @@
 [package]
 name = "recall"
-version = "0.5.5"
+version = "0.8.0"
 description = "Recall — a local-first desktop app for browsing your Claude Code prompt history"
 authors = ["beckryu"]
 license = "MIT"
 edition = "2021"
+# 바이너리가 둘이다(GUI 앱 `recall`, 헤드리스 수집기 `recall-ingest`).
+# 어느 쪽이 앱인지 못 박지 않으면 tauri build 가 "failed to find main binary" 로 죽는다.
+default-run = "recall"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -26,4 +29,12 @@ serde_json = "1"
 tauri-plugin-clipboard-manager = "2.3.2"
 rusqlite = { version = "0.39.0", features = ["bundled"] }
 dirs = "6.0.0"
+# 아카이브(.jsonl.gz)를 읽기 위해. Claude Code 가 90일 뒤 원본을 지워도 수집은 계속돼야 한다.
+flate2 = "1"
+
+# launchd 가 GUI 없이 돌리는 헤드리스 수집기. 앱과 **같은** ingest.rs 를 쓴다 —
+# 추출 로직이 두 벌이 되는 순간 그것들은 조용히 갈라진다(438 사고의 형태).
+[[bin]]
+name = "recall-ingest"
+path = "src/bin/recall_ingest.rs"
 
