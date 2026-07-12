@@ -60,7 +60,21 @@ cp "$INGEST_SRC"                        "$BIN_DIR/recall-ingest"
 chmod +x "$BIN_DIR/sweep.sh" "$BIN_DIR/recall-ingest"
 # 훅의 건강 검사가 사본이 갈라졌는지 볼 수 있도록 레포 경로를 남긴다.
 printf '%s\n' "$REPO" > "$BIN_DIR/.repo"
-echo "  ✅ 스위퍼(사본): $BIN_DIR"
+
+# 버전 딱지 — **방금 설치한 바이너리 자신에게 묻는다.** 레포의 버전 문자열을 찍으면
+# 수집기를 다시 빌드하지 않고 install.sh 만 돌렸을 때 낡은 바이너리에 새 딱지가 붙는다.
+# 앱 푸터가 이 값을 읽어 `v0.9.5 (0.9.4)` 처럼 보여주므로, 딱지가 거짓이면 표시도 거짓이 된다.
+INGEST_VER="$("$BIN_DIR/recall-ingest" --version 2>/dev/null)"
+if [ -z "$INGEST_VER" ]; then
+  echo
+  echo "❌ 설치된 수집기가 버전을 답하지 않습니다: $BIN_DIR/recall-ingest"
+  echo "   --version 을 모르는 낡은 바이너리입니다. 다시 빌드하세요:"
+  echo "     cargo build --release --bin recall-ingest --manifest-path src-tauri/Cargo.toml"
+  echo
+  exit 1
+fi
+printf '%s\n' "$INGEST_VER" > "$BIN_DIR/.version"
+echo "  ✅ 스위퍼(사본): $BIN_DIR (v$INGEST_VER)"
 
 # ── 3. launchd 등록 (매시간) ─────────────────────────────────────────────
 cat > "$PLIST" <<PLIST_EOF
