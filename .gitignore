@@ -26,6 +26,9 @@ dist-ssr
 # Claude Code local settings
 .claude/settings.local.json
 
+# CodeGraph 의 로컬 인덱스 — 소스에서 재생성되는 파생물이라 커밋하지 않는다.
+.codegraph/
+
 # Tauri icon 이 생성하는 모바일 리소스 (데스크톱 전용 앱이라 쓰지 않음)
 src-tauri/icons/android/
 src-tauri/icons/ios/
