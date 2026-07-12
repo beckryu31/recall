@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { getVersion } from "@tauri-apps/api/app";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
@@ -255,6 +255,70 @@ function FoldedSegment({
   );
 }
 
+/**
+ * 캡이 걸린 산문 렌더러. **레거시 `prompts.response` 를 그리는 모든 경로가 이걸 쓴다.**
+ *
+ * 세그먼트 경로에는 캡이 있었지만 레거시 경로에는 없었다. 그래서 프롬프트 5055 의
+ * 218KB 옛 추출본(개행 62,941개)이 `▸ 옛 추출본` 을 누르는 순간 앱을 1.1초 얼렸다 —
+ * 버그가 죽은 게 아니라 **클릭 한 번 뒤로 옮겨져 있었다.**
+ *
+ * `<pre>` 는 자식이 **텍스트 노드 하나**다. 220KB 든 2MB 든 DOM 노드 1개.
+ * react-markdown 은 같은 텍스트로 **hast 노드 94,000개**를 만든다.
+ * 브라우저를 얼리는 건 바이트가 아니라 **노드 수**다.
+ */
+function ProseView({ text }: { text: string }) {
+  const [forceMarkdown, setForceMarkdown] = useState(false);
+  const { nlines, nbytes } = useMemo(
+    () => ({
+      nlines: (text.match(/\n/g)?.length ?? 0) + 1,
+      // 세그먼트 쪽 캡(s.nbytes)과 **같은 축**으로 잰다. text.length 는 문자 수라
+      // 한글에서 바이트보다 훨씬 작게 나와 두 경로의 임계가 달라진다.
+      nbytes: new TextEncoder().encode(text).length,
+    }),
+    [text]
+  );
+
+  if ((nlines > PROSE_MAX_LINES || nbytes > PROSE_MAX_BYTES) && !forceMarkdown) {
+    return (
+      <div style={{ minWidth: 0 }}>
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: 8,
+            fontSize: 11,
+            color: "#a80",
+            marginBottom: 6,
+          }}
+        >
+          긴 텍스트 · {nlines.toLocaleString()}줄 · {humanBytes(nbytes)} (원문으로 표시)
+          <button
+            onClick={() => setForceMarkdown(true)}
+            title="노드 수가 많아 렌더링이 멈출 수 있습니다."
+            style={{
+              border: "1px solid #eecfa0",
+              background: "#fff",
+              color: "#a80",
+              borderRadius: 4,
+              cursor: "pointer",
+              fontSize: 11,
+              padding: "1px 6px",
+            }}
+          >
+            마크다운으로 렌더
+          </button>
+        </div>
+        <pre style={PRE}>{text}</pre>
+      </div>
+    );
+  }
+  return (
+    <div className="markdown-body" style={{ minWidth: 0 }}>
+      <ReactMarkdown remarkPlugins={[remarkGfm]}>{text}</ReactMarkdown>
+    </div>
+  );
+}
+
 /** 응답 하나 = 세그먼트 시퀀스. 이게 곧 "접어넣기" 의 결과물이다. */
 function SegmentView({ segments }: { segments: Segment[] }) {
   return (
@@ -344,6 +408,8 @@ export default function App() {
   const [refetchAllLoading, setRefetchAllLoading] = useState(false);
   const [confirmRefetchAll, setConfirmRefetchAll] = useState(false);
   const [segments, setSegments] = useState<Segment[]>([]);
+  // 수집된 응답의 산문 평탄화본. [복사] 가 집어가는 것 — 화면이 읽히는 그대로다.
+  const [narrative, setNarrative] = useState<string | null>(null);
   const [showLegacy, setShowLegacy] = useState(false);
   const [ingesting, setIngesting] = useState(false);
   const [pendingNew, setPendingNew] = useState(0);
@@ -668,9 +734,15 @@ export default function App() {
   // 세그먼트는 헤더만 가져온다. body 는 사용자가 펼칠 때 따로 — 그래서 2.5MB 응답도 즉시 뜬다.
   const loadSegments = async (promptId: number) => {
     try {
-      setSegments(await invoke<Segment[]>("list_segments", { promptId }));
+      const [segs, narr] = await Promise.all([
+        invoke<Segment[]>("list_segments", { promptId }),
+        invoke<string | null>("get_narrative", { promptId }),
+      ]);
+      setSegments(segs);
+      setNarrative(narr);
     } catch (e) {
       setSegments([]);
+      setNarrative(null);
       setError(String(e));
     }
   };
@@ -683,6 +755,7 @@ export default function App() {
     setResponseEditing(false);
     setConfirmingDelete(false);
     setSegments([]);
+    setNarrative(null);
     setShowLegacy(false);
     loadResponse(p.id);
     loadSegments(p.id);
@@ -724,10 +797,25 @@ export default function App() {
     if (selected) loadResponse(selected.id, true);
   };
 
+  // [복사] 는 **화면에 보이는 것**을 집어가야 한다.
+  //
+  // 세그먼트가 있으면 화면이 보여주는 건 세그먼트인데, 복사 버튼은 옛 `prompts.response` 를
+  // 집어가고 있었다. 그 둘을 다 가진 1,665행에서 **조용히 틀린 것을 클립보드에 넣었다.**
+  // 프롬프트 5497 이 최악이다 — 237바이트 스텁이 있어서 버튼이 **활성**인 채로
+  // 205KB 대신 237바이트를 건넸다.
+  //
+  // narrative 를 집어가는 이유: 세그먼트를 전부 이어붙이면 도구 덤프까지 딸려와 최대 2.5MB 가
+  // 되는데, 화면에도 그건 접혀 있다. narrative 는 산문 + 도구 한 줄 요약 — 화면이 읽히는 그대로다.
+  const copyText = segments.length > 0 ? narrative ?? responseDraft : responseDraft;
+
   const copyResponse = async () => {
-    if (!responseDraft) return;
-    await writeText(responseDraft);
-    showToast("응답 복사됨");
+    if (!copyText) return;
+    await writeText(copyText);
+    showToast(
+      segments.length > 0 && narrative
+        ? `응답 복사됨 (수집본 ${humanBytes(new TextEncoder().encode(narrative).length)})`
+        : "응답 복사됨"
+    );
   };
 
   // 짧은 확인용. "저장됨" 같은 스쳐도 되는 메시지에만 쓴다.
@@ -1873,28 +1961,24 @@ export default function App() {
                               {humanBytes(responseDraft.length)})
                             </button>
                             {showLegacy && (
-                              <div className="markdown-body" style={{ marginTop: 8, minWidth: 0 }}>
-                                <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                                  {responseDraft}
-                                </ReactMarkdown>
+                              <div style={{ marginTop: 8, minWidth: 0 }}>
+                                <ProseView text={responseDraft} />
                               </div>
                             )}
                           </div>
                         )}
                       </>
                     ) : responseDraft ? (
-                      <div className="markdown-body" style={{ minWidth: 0 }}>
-                        <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                          {responseDraft}
-                        </ReactMarkdown>
-                      </div>
+                      <ProseView text={responseDraft} />
                     ) : (
                       <div style={{ color: "#aaa" }}>(응답 없음)</div>
                     )}
                   </div>
                 )}
                 <div style={{ display: "flex", gap: 10, marginTop: 10 }}>
-                  <button onClick={copyResponse} disabled={!responseDraft}>
+                  {/* 세그먼트가 102개 떠 있는데 옛 response 가 비었다는 이유로 복사가 회색이던
+                      행이 18개 있었다. 복사할 게 있으면 누를 수 있어야 한다. */}
+                  <button onClick={copyResponse} disabled={!copyText}>
                     복사
                   </button>
                   <button

@@ -1497,6 +1497,27 @@ fn get_segment_body(segment_id: i64) -> Result<Option<String>, String> {
     .map_err(|e| e.to_string())
 }
 
+/// 수집된 응답의 **산문 평탄화본**. 도구 본문은 `[tool: Bash — cargo test]` 한 줄로 치환돼 있다.
+///
+/// 화면이 읽히는 그대로다 — 산문은 그대로, 도구는 접힌 한 줄. 그래서 **[복사] 가 집어가는 것**이다.
+/// 세그먼트를 전부 이어붙이면 도구 덤프까지 딸려와 최대 2.5MB 가 되는데, 화면에도 그건 접혀 있다.
+///
+/// 읽기 전용이다. 이 커맨드는 아무것도 쓰지 않는다.
+#[tauri::command]
+fn get_narrative(prompt_id: i64) -> Result<Option<String>, String> {
+    let conn = open_conn()?;
+    let narrative: Option<String> = conn
+        .query_row(
+            "SELECT narrative FROM prompts WHERE id = ?1",
+            params![prompt_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?
+        .flatten();
+    Ok(narrative.filter(|s| !s.trim().is_empty()))
+}
+
 /// 모든 세션을 다시 수집한다.
 ///
 /// 매번 전체를 다시 읽는다. 391MB 를 몇 초에 훑으므로 바이트 커서가 필요 없고,
@@ -1661,6 +1682,7 @@ pub fn run() {
             remove_prompt_tag,
             list_segments,
             get_segment_body,
+            get_narrative,
             ingest_all_sessions,
             ingest_pending,
             db_head,
