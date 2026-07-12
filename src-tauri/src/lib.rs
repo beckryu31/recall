@@ -1481,6 +1481,41 @@ struct DbHead {
     pending: i64,
 }
 
+/// 수집 상태. **판정은 여기서 하지 않는다** — `hooks/log_prompt.py` 가 매 프롬프트마다
+/// 계산해 `capture_health` 에 써 두고, 앱은 그걸 읽기만 한다.
+///
+/// 같은 판정 로직을 Rust 에 또 짜면 두 벌이 되고, 두 벌은 조용히 갈라진다.
+/// 그리고 훅은 앱이 닫혀 있어도 돌지만 앱은 그렇지 않으므로, 훅이 진실의 원천이어야 한다.
+#[derive(Serialize, Debug)]
+struct CaptureHealth {
+    problems: String,
+    checked_at: Option<String>,
+}
+
+#[tauri::command]
+fn capture_health() -> Result<CaptureHealth, String> {
+    let conn = open_conn()?;
+    let row: Option<(String, String)> = conn
+        .query_row(
+            "SELECT problems, checked_at FROM capture_health WHERE id = 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .unwrap_or(None);
+    Ok(match row {
+        Some((p, at)) => CaptureHealth {
+            problems: p,
+            checked_at: Some(at),
+        },
+        // 훅이 아직 한 번도 안 돌았다. 판단할 근거가 없으므로 정상이라고 말하지 않는다.
+        None => CaptureHealth {
+            problems: String::new(),
+            checked_at: None,
+        },
+    })
+}
+
 #[tauri::command]
 fn db_head() -> Result<DbHead, String> {
     let conn = open_conn()?;
@@ -1561,7 +1596,8 @@ pub fn run() {
             get_segment_body,
             ingest_all_sessions,
             ingest_pending,
-            db_head
+            db_head,
+            capture_health
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

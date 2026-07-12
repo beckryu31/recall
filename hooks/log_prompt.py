@@ -28,12 +28,14 @@ import sqlite3
 import sys
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 HOME = Path.home()
 DB_PATH = HOME / ".claude" / "prompts.db"
 SPOOL_DIR = HOME / ".claude" / "recall-spool" / "prompts"
+MANIFEST = HOME / ".claude" / "recall-archive" / "manifest.json"
+STAMP = HOME / ".claude" / "recall-spool" / ".last-health-warn"
 
 # DB 가 잠겨 있으면 기다린다. 앱 쪽(3초)보다 길게 잡은 것은 의도적이다 —
 # 앱 쿼리가 실패하면 사용자가 다시 누르면 그만이지만, 훅이 실패하면 행이 사라진다.
@@ -52,6 +54,183 @@ def write_spool(raw: str):
         return path
     except Exception:
         return None
+
+
+def drain_spool(conn, keep):
+    """DB 에 못 들어간 채 스풀에 남아 있는 프롬프트를 주워 담는다.
+
+    스풀에 쓰기만 하고 비우지 않으면 그건 write-only 무덤이다 — 프롬프트가 **보존**은 되지만
+    **복구되지 않는다.** DB 쓰기가 한 번이라도 실패했다면(락·디스크 참) 그 프롬프트는
+    다음 성공적인 훅 실행에서 여기로 돌아온다.
+
+    중복 방지는 (cc_turn_id, prompt) 로 한다. INSERT 는 성공했는데 unlink 가 실패한 경우가
+    있을 수 있기 때문이다. cc_turn_id 는 전역 유일하지 않으므로 prompt 텍스트와 함께 본다.
+    """
+    try:
+        files = sorted(SPOOL_DIR.glob("*.json"))
+    except OSError:
+        return
+    for path in files[:50]:  # 30초 타임아웃을 넘기지 않도록 한 번에 조금씩
+        if path == keep:
+            continue
+        try:
+            data = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            # 파싱 자체가 안 되는 파일은 지우지 않는다 — 사람이 볼 수 있게 남긴다.
+            continue
+        try:
+            dup = conn.execute(
+                "SELECT 1 FROM prompts WHERE cc_turn_id IS ?1 AND prompt = ?2 LIMIT 1",
+                (data.get("prompt_id"), data.get("prompt", "")),
+            ).fetchone()
+            if dup is None:
+                conn.execute(
+                    """INSERT INTO prompts
+                       (session_id, cwd, prompt, created_at, cc_turn_id, transcript_path)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    (
+                        data.get("session_id"),
+                        data.get("cwd"),
+                        data.get("prompt", ""),
+                        # 스풀 파일명이 time_ns 로 시작한다. 원래 시각을 최대한 살린다.
+                        datetime.fromtimestamp(
+                            int(path.name.split("-")[0]) / 1e9
+                        ).isoformat(timespec="seconds"),
+                        data.get("prompt_id"),
+                        data.get("transcript_path"),
+                    ),
+                )
+            conn.commit()
+            path.unlink()
+        except Exception:
+            # 이번에도 실패하면 그대로 둔다. 다음 기회에 다시 시도한다.
+            return
+
+
+def health_warning(check_db=True):
+    """수집이 조용히 멈췄으면 경고 문자열을 돌려준다. 정상이면 None.
+
+    ## 왜 훅에서 하는가
+
+    수집기는 Claude Code 를 막지 않으려고 **무슨 일이 있어도 조용히 실패**하도록 만들어졌다.
+    그런데 그건 **모든 실패가 구조적으로 조용해진다**는 뜻이고, 조용한 실패는 30~90일 뒤
+    **데이터 부재**로만 드러난다 — 그때는 이미 세션 기록이 삭제돼 복구가 불가능하다.
+
+    그래서 알람을 **사용자가 피할 수 없는 경로**에 둔다. UserPromptSubmit 훅의 stdout 은
+    Claude 의 컨텍스트에 주입되므로(실증 확인함), **Claude 가 직접 사용자에게 말한다.**
+    아무도 열 필요 없다고 설계한 GUI 뒤에 유일한 알람을 두지 않는다.
+
+    ## 왜 DB 없이도 도는가
+
+    DB 가 망가진 상황이야말로 경고가 가장 필요한 때다. 스풀 적체·디스크·아카이브 정지는
+    **파일시스템만 봐도** 알 수 있고, 그게 DB 를 못 열 때 유일하게 남는 신호다.
+    """
+    problems = []
+
+    # ① 스풀 적체 = 프롬프트가 DB 에 못 들어가고 있다. 가장 심각하다.
+    #    (프롬프트는 응답과 달리 재생성이 불가능하다 — 이 훅이 유일한 기록자다.)
+    try:
+        n = len(list(SPOOL_DIR.glob("*.json")))
+        if n > 0:
+            problems.append(f"프롬프트 {n}개가 DB 에 기록되지 못하고 스풀에 남아 있습니다")
+    except OSError:
+        pass
+
+    # ② 아카이브가 멈췄다 = launchd 스위퍼가 안 돈다.
+    #    세션 기록은 cleanupPeriodDays 뒤 삭제되므로, 아카이브가 멈추면 영구 소실이 시작된다.
+    try:
+        age = (time.time() - MANIFEST.stat().st_mtime) / 86400
+        if age >= 3:
+            problems.append(
+                f"세션 기록 아카이브가 {age:.0f}일째 갱신되지 않았습니다 "
+                f"(launchctl list | grep recall 확인)"
+            )
+    except OSError:
+        problems.append("세션 기록 아카이브가 아직 없습니다 (bash hooks/install.sh)")
+
+    # ③ 디스크. 아카이브와 DB 가 자라므로 여유가 없으면 조용히 실패하기 시작한다.
+    try:
+        st = os.statvfs(str(HOME))
+        free_gb = st.f_bavail * st.f_frsize / 1e9
+        if free_gb < 5:
+            problems.append(f"디스크 여유가 {free_gb:.1f}GB 뿐입니다")
+    except OSError:
+        pass
+
+    # ④ 수집이 멈췄다. DB 를 열 수 있을 때만 본다.
+    if check_db:
+        try:
+            conn = sqlite3.connect(DB_PATH, timeout=2.0)
+            try:
+                row = conn.execute("SELECT MAX(ingested_at) FROM ingest_state").fetchone()
+            finally:
+                conn.close()
+            if row and row[0]:
+                # ingested_at 은 datetime('now') = UTC. utcnow() 는 3.12+ 에서 deprecated 라
+                # stderr 경고가 사용자 화면에 뜰 수 있다. timezone-aware 로 계산한다.
+                last = datetime.fromisoformat(row[0]).replace(tzinfo=timezone.utc)
+                days = (datetime.now(timezone.utc) - last).days
+                if days >= 3:
+                    problems.append(f"Recall 이 {days}일째 응답을 수집하지 못했습니다")
+        except Exception:
+            pass
+
+    if not problems:
+        return None
+    return "[Recall 수집 상태 경고 — 사용자에게 알려주세요]\n" + "\n".join(
+        f"- {p}" for p in problems
+    )
+
+
+def warn_if_unhealthy(check_db=True):
+    """건강 상태를 계산해 (1) DB 에 기록하고 (2) 필요하면 stdout 으로 경고한다.
+
+    앱도 이 상태를 보여주지만, **판정은 여기서만 한다.** 같은 로직을 Rust 에 또 짜면
+    두 벌이 되고, 두 벌은 조용히 갈라진다 — 그게 프롬프트 438개를 죽인 사고의 형태다.
+    훅이 쓰고 앱은 읽는다.
+
+    stdout 경고는 한 시간에 한 번까지만. 매 프롬프트마다 짖으면 무시당한다.
+    """
+    msg = health_warning(check_db)
+
+    # 앱이 읽을 수 있게 남긴다. DB 를 못 열면 그냥 넘어간다 — 그때는 stdout 이 유일한 채널이다.
+    if check_db:
+        try:
+            conn = sqlite3.connect(DB_PATH, timeout=2.0)
+            try:
+                conn.execute(
+                    """CREATE TABLE IF NOT EXISTS capture_health (
+                           id         INTEGER PRIMARY KEY CHECK (id = 1),
+                           problems   TEXT,
+                           checked_at TEXT NOT NULL DEFAULT (datetime('now'))
+                       )"""
+                )
+                conn.execute(
+                    """INSERT INTO capture_health (id, problems, checked_at)
+                       VALUES (1, ?1, datetime('now'))
+                       ON CONFLICT(id) DO UPDATE SET
+                           problems = excluded.problems, checked_at = excluded.checked_at""",
+                    (msg or "",),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+        except Exception:
+            pass
+
+    if not msg:
+        return
+    try:
+        if STAMP.exists() and time.time() - STAMP.stat().st_mtime < 3600:
+            return
+    except OSError:
+        pass
+    print(msg)
+    try:
+        STAMP.parent.mkdir(parents=True, exist_ok=True)
+        STAMP.touch()
+    except OSError:
+        pass
 
 
 def init_db(conn):
@@ -99,33 +278,52 @@ def main():
     # ① 무엇보다 먼저 원본을 남긴다.
     spool_path = write_spool(raw)
 
-    # ② 그 다음 DB.
-    data = json.loads(raw)
-    conn = sqlite3.connect(DB_PATH, timeout=BUSY_TIMEOUT_SEC)
+    # ② 그 다음 DB. 실패해도 여기서 죽지 않는다 —
+    #    DB 가 영구히 망가진 상황이야말로 ④의 경고가 가장 필요한 때인데,
+    #    여기서 예외를 올려버리면 그 경고에 영영 도달하지 못한다.
+    ok = False
     try:
-        init_db(conn)
-        conn.execute(
-            """INSERT INTO prompts (session_id, cwd, prompt, created_at, cc_turn_id, transcript_path)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (
-                data.get("session_id"),
-                data.get("cwd"),
-                data.get("prompt", ""),
-                datetime.now().isoformat(timespec="seconds"),
-                data.get("prompt_id"),
-                data.get("transcript_path"),
-            ),
-        )
-        conn.commit()
-    finally:
-        conn.close()
-
-    # ③ DB 에 안전하게 들어갔을 때만 스풀을 지운다.
-    if spool_path is not None:
+        data = json.loads(raw)
+        conn = sqlite3.connect(DB_PATH, timeout=BUSY_TIMEOUT_SEC)
         try:
-            spool_path.unlink()
-        except OSError:
-            pass
+            init_db(conn)
+            conn.execute(
+                """INSERT INTO prompts
+                   (session_id, cwd, prompt, created_at, cc_turn_id, transcript_path)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (
+                    data.get("session_id"),
+                    data.get("cwd"),
+                    data.get("prompt", ""),
+                    datetime.now().isoformat(timespec="seconds"),
+                    data.get("prompt_id"),
+                    data.get("transcript_path"),
+                ),
+            )
+            conn.commit()
+            ok = True
+            # ③ DB 에 안전하게 들어갔을 때만 스풀을 지운다.
+            if spool_path is not None:
+                try:
+                    spool_path.unlink()
+                except OSError:
+                    pass
+            # 예전에 못 들어간 프롬프트를 주워 담는다. 스풀은 무덤이 아니라 대기실이다.
+            try:
+                drain_spool(conn, spool_path)
+            except Exception:
+                pass
+        finally:
+            conn.close()
+    except Exception:
+        pass  # payload 는 스풀에 있다. 아무것도 잃지 않았다.
+
+    # ④ 건강 경고. **DB 가 없어도 동작해야 한다** — 스풀 적체·디스크·아카이브 정지는
+    #    파일시스템만 봐도 알 수 있고, 그게 DB 가 망가졌을 때 유일하게 남는 신호다.
+    try:
+        warn_if_unhealthy(check_db=ok)
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":
