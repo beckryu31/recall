@@ -16,7 +16,14 @@ webview runs under a CSP that blocks remote resources, so nothing in a captured 
 > **The app's interface, and every warning it emits, is in Korean.** This README is bilingual; the app is not.
 > Button labels below are quoted exactly as they appear on screen.
 
-![Recall — browsing prompt history, with the prompt and Claude's response side by side](docs/screenshot.png)
+![Recall — a prompt, and Claude's full response beside it: prose rendered as Markdown, tool calls collapsed to one line each](docs/screenshot.png)
+
+<p align="center">
+  <em>Projects on the left, your prompt history in the middle, the prompt and Claude's response on the right.<br>
+  Tool calls are collapsed — <code>▸ Bash …&nbsp;3 KB</code>, <code>▸ 결과&nbsp;2 KB</code> — and open on click.<br>
+  The response on screen is the one that stitched a chopped-up turn back together: a prompt whose stored response<br>
+  was <strong>0 KB</strong> became a complete 205 KB story. Recall, recalling how Recall got built.</em>
+</p>
 
 ---
 

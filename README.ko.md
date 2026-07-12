@@ -12,7 +12,14 @@ Recall이 그걸 해결합니다. 훅이 제출하는 모든 프롬프트를 로
 
 모든 것이 내 컴퓨터 안에 있습니다. Recall은 네트워크 호출을 하지 않습니다 — 텔레메트리도, 계정도, 서버도 없습니다. 웹뷰는 원격 리소스를 차단하는 CSP 아래서 돌기 때문에, **수집된 응답 안에 원격 이미지 URL이 있어도 불러오지 않습니다.**
 
-![Recall — 프롬프트 기록 탐색, 프롬프트와 Claude의 응답을 나란히](docs/screenshot.png)
+![Recall — 프롬프트와 Claude의 응답 전체: 산문은 마크다운으로, 도구 호출은 한 줄로 접혀서](docs/screenshot.png)
+
+<p align="center">
+  <em>왼쪽에 프로젝트, 가운데에 프롬프트 기록, 오른쪽에 프롬프트와 Claude의 응답.<br>
+  도구 호출은 접혀 있고 — <code>▸ Bash …&nbsp;3 KB</code>, <code>▸ 결과&nbsp;2 KB</code> — 누르면 펼쳐집니다.<br>
+  화면의 응답은 <strong>갈라진 턴을 다시 꿰맨</strong> 바로 그 작업입니다.<br>
+  저장된 응답이 <strong>0 KB</strong> 이던 프롬프트가 <strong>205 KB</strong> 의 완결된 이야기가 됐습니다.</em>
+</p>
 
 ---
 
