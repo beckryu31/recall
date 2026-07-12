@@ -551,6 +551,14 @@ const SESSION_FIRST_CTE: &str = "WITH session_first AS (
     ) m ON m.session_id = p.session_id AND m.min_id = p.id
 )";
 
+/// 응답이 있다는 술어. 두 가지를 뜻한다 — 레거시 `response` 텍스트가 있거나,
+/// **세그먼트로 수집됐거나.** (`prompts` 가 `p` 로 별칭돼 있는 것을 전제한다.)
+///
+/// **한 곳에서만 정의한다.** 목록(`list_prompts`)과 증분 갱신(`responded_ids`)이 각자
+/// 술어를 들고 있으면 둘이 조용히 어긋나고, 그러면 배지가 갱신될 때마다 붙었다 떨어졌다 한다.
+const HAS_RESPONSE: &str = "(p.response IS NOT NULL AND p.response <> '')
+                 OR EXISTS (SELECT 1 FROM turn_segments s WHERE s.prompt_id = p.id)";
+
 #[tauri::command]
 fn list_prompts(
     limit: i64,
@@ -566,25 +574,21 @@ fn list_prompts(
     let conn = open_conn()?;
 
     let mut sql = String::from(SESSION_FIRST_CTE);
-    // has_response: 응답이 있다는 것은 이제 두 가지를 뜻한다 —
-    // 레거시 `response` 텍스트가 있거나, **세그먼트로 수집됐거나.**
-    // 이 술어를 안 고치면 완전본으로 수집된 프롬프트가 전부 "응답 없음" 으로 보이고,
-    // 삭제 후보로도 잡힌다(그건 Stage 0 에서 이미 막았다).
-    sql.push_str(
+    // has_response 의 뜻은 `HAS_RESPONSE` 에 있다 — 이 술어를 안 쓰면 완전본으로 수집된
+    // 프롬프트가 전부 "응답 없음" 으로 보이고, 삭제 후보로도 잡힌다(그건 Stage 0 에서 이미 막았다).
+    sql.push_str(&format!(
         " SELECT p.id, p.session_id, p.cwd, p.prompt, p.created_at, b.prompt_id,
                  (SELECT GROUP_CONCAT(t.name, char(1))
                   FROM prompt_tags pt
                   JOIN tags t ON t.id = pt.tag_id
                   WHERE pt.prompt_id = p.id) AS tags,
-                 (CASE WHEN (p.response IS NOT NULL AND p.response <> '')
-                         OR EXISTS (SELECT 1 FROM turn_segments s WHERE s.prompt_id = p.id)
-                       THEN 1 ELSE 0 END) AS has_response,
+                 (CASE WHEN {HAS_RESPONSE} THEN 1 ELSE 0 END) AS has_response,
                  p.kind
           FROM prompts p
           LEFT JOIN session_first sf ON sf.session_id = p.session_id
           LEFT JOIN prompt_bookmarks b ON b.prompt_id = p.id
-          WHERE 1=1",
-    );
+          WHERE 1=1"
+    ));
     let mut bind: Vec<Value> = Vec::new();
 
     // task-notification 같은 주입 이벤트도 훅을 발생시켜 행을 만든다(382개).
@@ -653,6 +657,42 @@ fn list_prompts(
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| e.to_string())?;
     Ok(rows)
+}
+
+/// 건네받은 id 중 **지금은 응답이 있는** 것만 돌려준다.
+///
+/// 자동 수집은 `turn_segments` 에만 쓰므로, 목록이 들고 있는 `has_response` 는 응답이
+/// 들어와도 그 사실을 모른 채 늙는다. 그렇다고 3초마다 `list_prompts` 를 다시 태우면
+/// 검색·필터·정렬을 통째로 다시 돌리고 행 집합까지 갈아끼우게 된다 — 스크롤과 선택이
+/// 흔들린다. 대신 아직 "응답 없음" 인 행만 여기서 다시 판정한다.
+///
+/// **아직 false 인 것만 물어도 충분한 이유:** 세그먼트를 지우는 경로가 코드에 없다.
+/// 즉 `has_response` 는 false → true 로만 움직인다. (프롬프트 자체가 삭제되면 행이
+/// 통째로 사라지므로 여기서 다룰 일이 아니다.)
+///
+/// 호출부는 목록 한 페이지(200행)만 넘긴다 — SQLite 바인딩 변수 한도와 무관한 크기다.
+#[tauri::command]
+fn responded_ids(ids: Vec<i64>) -> Result<Vec<i64>, String> {
+    let conn = open_conn()?;
+    responded_among(&conn, &ids)
+}
+
+fn responded_among(conn: &Connection, ids: &[i64]) -> Result<Vec<i64>, String> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let placeholders = vec!["?"; ids.len()].join(",");
+    let sql = format!(
+        "SELECT p.id FROM prompts p
+         WHERE p.id IN ({placeholders}) AND ({HAS_RESPONSE})"
+    );
+    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+    let mapped = stmt
+        .query_map(params_from_iter(ids.iter()), |row| row.get::<_, i64>(0))
+        .map_err(|e| e.to_string())?;
+    mapped
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -1666,6 +1706,7 @@ pub fn run() {
         .plugin(tauri_plugin_clipboard_manager::init())
         .invoke_handler(tauri::generate_handler![
             list_prompts,
+            responded_ids,
             list_cwds,
             set_cwd_alias,
             get_response,
@@ -1884,5 +1925,46 @@ mod tests {
         assert_eq!(scan.protected, 1);
         assert_eq!(scan.scanned, 0);
         assert!(scan.candidates.is_empty());
+    }
+
+    /// 목록의 "응답 없음" 배지를 지우는 술어. 자동 수집은 `turn_segments` 에만 쓰므로
+    /// **세그먼트만 있는 행도 "응답 있음" 이어야 한다.** 이걸 놓치면 응답이 다 들어온
+    /// 뒤에도 배지가 남고, 사용자는 자동 수집이 죽었다고 믿는다.
+    #[test]
+    fn responded_counts_segments_not_just_legacy_response() {
+        let conn = test_db();
+        let segs_only = insert_prompt(&conn, Some("s"), Some("/c"), 1);
+        let legacy_only = insert_prompt(&conn, Some("s"), Some("/c"), 1);
+        let neither = insert_prompt(&conn, Some("s"), Some("/c"), 1);
+        conn.execute(
+            "INSERT INTO turn_segments (prompt_id, src_uuid, block_idx, seq, kind)
+             VALUES (?1, 'u1', 0, 0, 'text')",
+            params![segs_only],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE prompts SET response = '옛 추출본' WHERE id = ?1",
+            params![legacy_only],
+        )
+        .unwrap();
+
+        let done = responded_among(&conn, &[segs_only, legacy_only, neither]).unwrap();
+
+        assert!(
+            done.contains(&segs_only),
+            "세그먼트로 수집이 끝난 행을 여전히 '응답 없음' 으로 봤다"
+        );
+        assert!(done.contains(&legacy_only), "레거시 응답이 있는 행을 놓쳤다");
+        assert!(
+            !done.contains(&neither),
+            "응답이 없는 행을 '응답 있음' 으로 표시했다"
+        );
+    }
+
+    /// 빈 목록에 대고 `IN ()` 을 만들면 SQL 이 깨진다. 앱은 매 tick 마다 이걸 부른다.
+    #[test]
+    fn responded_on_empty_input_is_not_an_error() {
+        let conn = test_db();
+        assert!(responded_among(&conn, &[]).unwrap().is_empty());
     }
 }
