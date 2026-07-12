@@ -44,6 +44,31 @@ BIN_DIR = HOME / ".claude" / "recall-bin"
 BUSY_TIMEOUT_SEC = 5.0
 
 
+def prompt_text(raw):
+    """payload 에서 프롬프트 본문을 꺼낸다. **꺼낼 수 없으면 None(= 판단 불가).**
+
+    `""` 와 `None` 의 차이가 이 함수의 전부다:
+
+    - `""` — 본문이 **없다**고 단정할 수 있다. 버려도 된다.
+    - `None` — 모양을 모르겠다. **버리면 안 된다.** 평소대로 스풀에 남겨 사람이 보게 한다.
+
+    파싱 못 한 payload 를 "빈 프롬프트" 로 단정하는 것이야말로 프롬프트를 잃는 길이다.
+    프롬프트 438개가 사라진 사고가 정확히 그 형태였다 — **복구 실패가 삭제의 근거로 쓰였다.**
+    """
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    p = data.get("prompt")
+    if p is None:
+        return ""  # 키가 없다 = 본문이 없다
+    if not isinstance(p, str):
+        return None  # 모르는 모양 → 판단하지 않는다
+    return p
+
+
 def write_spool(raw: str):
     """DB 를 건드리기 전에 payload 원본을 남긴다. 실패해도 조용히 None."""
     try:
@@ -80,6 +105,21 @@ def drain_spool(conn, keep):
         except (OSError, json.JSONDecodeError):
             # 파싱 자체가 안 되는 파일은 지우지 않는다 — 사람이 볼 수 있게 남긴다.
             continue
+
+        # 빈 프롬프트는 기록하지 않는다 (main 의 ⓪ 과 같은 이유). 이 규칙 이전에 만들어진
+        # 스풀 파일이 남아 있을 수 있으므로 여기서도 막는다.
+        #
+        # 그리고 **지운다.** 안 지우면 영원히 드레인되지 않는 파일이 되어 검사 ①
+        # ("프롬프트 N개가 DB 에 기록되지 못하고 스풀에 남아 있습니다") 가 오탐으로
+        # 짖는다 — 그건 알람을 죽이는 가장 빠른 길이다. 버리는 것은 본문이 없는 껍데기뿐이다.
+        p = data.get("prompt")
+        if isinstance(p, str) and not p.strip():
+            try:
+                path.unlink()
+            except OSError:
+                pass
+            continue
+
         try:
             dup = conn.execute(
                 "SELECT 1 FROM prompts WHERE cc_turn_id IS ?1 AND prompt = ?2 LIMIT 1",
@@ -348,6 +388,19 @@ def init_db(conn):
 
 def main():
     raw = sys.stdin.read()
+
+    # ⓪ 빈 프롬프트는 기록하지 않는다.
+    #
+    #   훅은 프롬프트의 **유일한 기록자**라서 "무엇이든 일단 적는다" 로 만들어져 있다.
+    #   그런데 payload 에 본문이 없으면 session_id 도 cwd 도 없는 **껍데기 행**이 생긴다.
+    #   그 행은 목록에 영원히 `응답 없음` 으로 남고, 자동 purge 로도 지워지지 않는다
+    #   (purge 는 세션 기록을 확인해야 하는데 세션이 없으므로 '판단 불가' → 후보에서 빠진다).
+    #
+    #   **판단할 수 있을 때만 버린다** — `prompt_text` 가 None 을 주면(파싱 불가·모르는 모양)
+    #   여기서 걸러내지 않고 평소대로 스풀에 남긴다.
+    text = prompt_text(raw)
+    if text is not None and not text.strip():
+        return
 
     # ① 무엇보다 먼저 원본을 남긴다.
     spool_path = write_spool(raw)
