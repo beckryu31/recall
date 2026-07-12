@@ -71,6 +71,11 @@ type Segment = {
 const PROSE_MAX_LINES = 800;
 const PROSE_MAX_BYTES = 32_000;
 
+// 검색 한 번은 prompt + narrative + response 세 컬럼(34MB)을 LIKE 로 훑는다 — 실측 82~95ms.
+// 사람이 타이핑을 멈춘 뒤에만 한 번 나가면 된다. 200ms 는 다음 타를 기다리기엔 충분히 길고,
+// 멈춘 뒤 기다림을 느끼기엔 충분히 짧다 (질의 자체가 ~90ms 이므로 체감 총합 ~290ms).
+const SEARCH_DEBOUNCE_MS = 200;
+
 type CaptureHealth = {
   /// 비었으면 정상. 판정은 훅(hooks/log_prompt.py)이 하고 앱은 읽기만 한다.
   problems: string;
@@ -310,7 +315,10 @@ export default function App() {
   const [prompts, setPrompts] = useState<Prompt[]>([]);
   const [selected, setSelected] = useState<Prompt | null>(null);
   const [draft, setDraft] = useState("");
-  const [search, setSearch] = useState("");
+  // 입력창에 보이는 값과 DB 에 나가는 값을 분리한다. 타이핑은 즉시 렌더되고, 질의만 디바운스된다.
+  const [search, setSearch] = useState(""); // 입력창이 보여주는 것
+  const [query, setQuery] = useState(""); // 실제로 DB 를 훑는 것
+  const [composing, setComposing] = useState(false); // IME 조합 중인가
   const [onlyBookmarked, setOnlyBookmarked] = useState(false);
   const [dateFrom, setDateFrom] = useState("");
   const [dateTo, setDateTo] = useState("");
@@ -460,7 +468,7 @@ export default function App() {
       const rows = await invoke<Prompt[]>("list_prompts", {
         limit: 200,
         offset: 0,
-        search: search || null,
+        search: query || null,
         cwd: cwdArg,
         onlyBookmarked,
         tag: tagFilter || null,
@@ -494,9 +502,21 @@ export default function App() {
     return () => window.removeEventListener("keydown", onKey);
   }, [refetchAllLoading, purgeDeleting]);
 
+  // ─────────────────────── 검색 디바운스 + IME ───────────────────────
+  //
+  // 한글은 **조합 중 자모마다** onChange 가 발화한다. "세그먼트" 를 치면
+  // ㅅ·ㅔ·ㄱ·ㅡ·ㅁ·ㅓ·ㄴ·ㅌ·ㅡ 로 9번이다. 디바운스만 걸고 조합을 무시하면,
+  // 타이핑을 잠깐 멈춘 순간의 **미완성 자모("ㅅ")로 34MB 를 훑는다** — 비싸고, 결과도 틀리다.
+  // 그래서 조합 중에는 타이머조차 걸지 않는다. 조합이 끝나면 그때 디바운스가 시작된다.
+  useEffect(() => {
+    if (composing) return;
+    const t = setTimeout(() => setQuery(search), SEARCH_DEBOUNCE_MS);
+    return () => clearTimeout(t); // 다음 타가 오면 취소 — 마지막 것만 살아남는다
+  }, [search, composing]);
+
   useEffect(() => {
     loadPrompts();
-  }, [search, cwdFilter, onlyBookmarked, tagFilter, dateFrom, dateTo]);
+  }, [query, cwdFilter, onlyBookmarked, tagFilter, dateFrom, dateTo]);
 
   // ─────────────────────── 목록 자동 갱신 (P1) ───────────────────────
   //
@@ -1111,6 +1131,13 @@ export default function App() {
               placeholder="검색..."
               value={search}
               onChange={(e) => setSearch(e.target.value)}
+              onCompositionStart={() => setComposing(true)}
+              // WebKit 은 compositionend 를 마지막 change 보다 **먼저** 낸다.
+              // 그래서 여기서 값을 직접 읽는다 — 이벤트 순서에 기대지 않는다.
+              onCompositionEnd={(e) => {
+                setSearch(e.currentTarget.value);
+                setComposing(false);
+              }}
               style={{
                 width: "100%",
                 padding: 10,
@@ -1123,7 +1150,12 @@ export default function App() {
             />
             {search && (
               <button
-                onClick={() => setSearch("")}
+                // 지우기는 디바운스를 건너뛴다. 사용자가 X 를 눌렀는데 200ms 뒤에
+                // 목록이 돌아오면 버튼이 씹힌 것처럼 느껴진다.
+                onClick={() => {
+                  setSearch("");
+                  setQuery("");
+                }}
                 title="검색어 지우기"
                 style={{
                   position: "absolute",
