@@ -658,6 +658,15 @@ pub fn ensure_schema(conn: &Connection) -> Result<(), String> {
              body      TEXT    NOT NULL,
              edited_at TEXT    NOT NULL DEFAULT (datetime('now')),
              PRIMARY KEY (prompt_id, src_uuid, block_idx)
+         );
+
+         -- 세션 기록이 자랐는지만 본다. 체크포인트가 아니라 더티 플래그다 --
+         -- 바이트 오프셋을 저장하지 않으므로 커서를 잘못 잡아 뒷부분을 잃는 실패가 없다.
+         -- 자란 파일은 언제나 처음부터 통째로 다시 읽는다.
+         CREATE TABLE IF NOT EXISTS ingest_state (
+             session_id  TEXT PRIMARY KEY,
+             src_mtime   INTEGER NOT NULL,
+             ingested_at TEXT NOT NULL DEFAULT (datetime('now'))
          );",
     )
     .map_err(|e| e.to_string())?;
@@ -777,6 +786,20 @@ pub fn ingest_session(
     Ok(())
 }
 
+fn sessions_where(conn: &Connection, extra: &str) -> Result<Vec<(String, String)>, String> {
+    let sql = format!(
+        "SELECT p.session_id, MIN(p.cwd)
+         FROM prompts p
+         WHERE p.session_id IS NOT NULL AND p.cwd IS NOT NULL {extra}
+         GROUP BY p.session_id"
+    );
+    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+    let mapped = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .map_err(|e| e.to_string())?;
+    mapped.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+}
+
 /// prompts 에 있는 모든 세션을 수집한다.
 pub fn ingest_all(
     conn: &mut Connection,
@@ -784,30 +807,93 @@ pub fn ingest_all(
     parse_epoch: &impl Fn(&str) -> Option<i64>,
     resolve_path: &impl Fn(&str, &str) -> Option<PathBuf>,
 ) -> Result<IngestStats, String> {
-    let sessions: Vec<(String, String)> = {
-        let mut stmt = conn
-            .prepare(
-                "SELECT p.session_id, MIN(p.cwd)
-                 FROM prompts p
-                 WHERE p.session_id IS NOT NULL AND p.cwd IS NOT NULL
-                 GROUP BY p.session_id",
-            )
-            .map_err(|e| e.to_string())?;
-        let mapped = stmt
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
-            .map_err(|e| e.to_string())?;
-        mapped.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?
-    };
+    let sessions = sessions_where(conn, "")?;
+    ingest_sessions(conn, &sessions, offset, parse_epoch, resolve_path)
+}
 
+fn mtime_of(path: &PathBuf) -> i64 {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// 세션 기록이 **자란 세션만** 수집한다. 앱이 15초마다 부르는 경로다.
+///
+/// mtime 으로 거르는 게 핵심이다. "세그먼트가 없는 프롬프트"로 거르면 안 된다 —
+/// task-notification 행(`kind='system'`)은 턴을 소유하지 않으므로 **영원히 세그먼트가 없고**,
+/// 그러면 조건이 절대 거짓이 되지 않아 11MB 파일을 15초마다 헛되이 다시 파싱한다.
+///
+/// 반대로 "한 번 수집했으면 끝"으로 잡아도 안 된다 — 진행 중인 턴은 응답이 계속 자라므로
+/// **파일이 자라는 동안 계속 다시 읽어야** 응답이 실시간으로 채워진다.
+/// mtime 은 그 둘을 정확히 가른다.
+pub fn ingest_pending(
+    conn: &mut Connection,
+    offset: i64,
+    parse_epoch: &impl Fn(&str) -> Option<i64>,
+    resolve_path: &impl Fn(&str, &str) -> Option<PathBuf>,
+) -> Result<IngestStats, String> {
+    let recent = sessions_where(
+        conn,
+        "AND p.created_at >= datetime('now','-7 days','localtime')",
+    )?;
+
+    let mut todo = Vec::new();
+    for (sid, cwd) in recent {
+        let Some(path) = resolve_path(&cwd, &sid) else {
+            continue;
+        };
+        let m = mtime_of(&path);
+        if m == 0 {
+            continue;
+        }
+        let seen: i64 = conn
+            .query_row(
+                "SELECT src_mtime FROM ingest_state WHERE session_id = ?1",
+                params![sid],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        if m > seen {
+            todo.push((sid, cwd));
+        }
+    }
+    ingest_sessions(conn, &todo, offset, parse_epoch, resolve_path)
+}
+
+fn ingest_sessions(
+    conn: &mut Connection,
+    sessions: &[(String, String)],
+    offset: i64,
+    parse_epoch: &impl Fn(&str) -> Option<i64>,
+    resolve_path: &impl Fn(&str, &str) -> Option<PathBuf>,
+) -> Result<IngestStats, String> {
+    let sessions = sessions.to_vec();
     let mut stats = IngestStats::default();
     for (sid, cwd) in sessions {
         let Some(path) = resolve_path(&cwd, &sid) else {
             stats.sessions_missing += 1;
             continue;
         };
+        // 파일을 읽기 **전에** mtime 을 잡는다. 읽는 도중에 자라면 다음 번에 다시 읽어야 하는데,
+        // 나중에 잡으면 그 성장분을 이미 봤다고 기록해 버려 영영 놓친다.
+        let m = mtime_of(&path);
+
         // 세션 하나를 한 트랜잭션으로. 절반만 수집된 상태를 만들지 않는다.
         let tx = conn.transaction().map_err(|e| e.to_string())?;
         ingest_session(&tx, &sid, &path, offset, parse_epoch, &mut stats)?;
+        if m > 0 {
+            tx.execute(
+                "INSERT INTO ingest_state (session_id, src_mtime, ingested_at)
+                 VALUES (?1, ?2, datetime('now'))
+                 ON CONFLICT(session_id) DO UPDATE SET
+                   src_mtime = excluded.src_mtime, ingested_at = excluded.ingested_at",
+                params![sid, m],
+            )
+            .map_err(|e| e.to_string())?;
+        }
         tx.commit().map_err(|e| e.to_string())?;
     }
     Ok(stats)

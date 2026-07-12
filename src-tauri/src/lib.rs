@@ -1452,6 +1452,57 @@ fn ingest_all_sessions() -> Result<ingest::IngestStats, String> {
     run_ingest()
 }
 
+/// 아직 수집 안 된 최근 프롬프트가 있는 세션만 수집한다. 앱의 tick 이 부른다.
+/// 보통 진행 중인 세션 하나뿐이라 파일 하나만 읽는다.
+#[tauri::command(async)]
+fn ingest_pending() -> Result<ingest::IngestStats, String> {
+    let mut conn = open_conn()?;
+    let offset = local_offset_seconds(&conn);
+    ingest::ingest_pending(&mut conn, offset, &parse_iso_to_epoch, &|cwd: &str, sid: &str| {
+        find_jsonl(cwd, sid).or_else(|| Some(jsonl_path(cwd, sid)))
+    })
+}
+
+/// 목록이 살아 있게 만드는 값싼 쿼리. **쓰기가 없다.**
+///
+/// 4,900행짜리 테이블에 대한 인덱스 SELECT 세 개라 마이크로초 단위다.
+/// 앱은 이 값만 3초마다 보고, 바뀌었을 때만 실제 목록을 다시 읽는다.
+#[derive(Serialize, Debug)]
+struct DbHead {
+    /// 새 프롬프트가 들어왔는지
+    max_prompt_id: i64,
+    /// 응답이 수집됐는지
+    max_segment_id: i64,
+    /// 수집기가 아직 분류하지 못한 최근 프롬프트 수. 상태 표시용이다.
+    ///
+    /// "세그먼트가 없는 프롬프트" 로 세면 안 된다 — task-notification 행은 턴을 소유하지
+    /// 않으므로 영원히 세그먼트가 없고, 그러면 이 값이 절대 0이 되지 않는다.
+    /// `kind IS NULL` 은 "수집기가 이 행을 아직 못 봤다" 를 정확히 뜻한다.
+    pending: i64,
+}
+
+#[tauri::command]
+fn db_head() -> Result<DbHead, String> {
+    let conn = open_conn()?;
+    conn.query_row(
+        "SELECT COALESCE((SELECT MAX(id) FROM prompts), 0),
+                COALESCE((SELECT MAX(id) FROM turn_segments), 0),
+                (SELECT COUNT(*) FROM prompts p
+                  WHERE p.session_id IS NOT NULL
+                    AND p.created_at >= datetime('now','-48 hours','localtime')
+                    AND p.kind IS NULL)",
+        [],
+        |r| {
+            Ok(DbHead {
+                max_prompt_id: r.get(0)?,
+                max_segment_id: r.get(1)?,
+                pending: r.get(2)?,
+            })
+        },
+    )
+    .map_err(|e| e.to_string())
+}
+
 /// rollback journal 모드에서는 쓰기 하나가 DB 전체를 잠근다. 훅과 앱이 함께 쓰는 이 DB 에선
 /// 그게 곧 프롬프트 행 유실이다. WAL 은 읽기와 쓰기가 서로를 막지 않으므로 이 경합을 없앤다.
 ///
@@ -1508,7 +1559,9 @@ pub fn run() {
             remove_prompt_tag,
             list_segments,
             get_segment_body,
-            ingest_all_sessions
+            ingest_all_sessions,
+            ingest_pending,
+            db_head
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

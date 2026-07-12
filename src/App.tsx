@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { getVersion } from "@tauri-apps/api/app";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
@@ -70,6 +70,12 @@ type Segment = {
 // 캡을 바이트에 걸면 엉뚱한 축에 갑옷을 입히는 것이다.
 const PROSE_MAX_LINES = 800;
 const PROSE_MAX_BYTES = 32_000;
+
+type DbHead = {
+  max_prompt_id: number;
+  max_segment_id: number;
+  pending: number;
+};
 
 type PurgeScan = {
   scanned: number;
@@ -324,6 +330,10 @@ export default function App() {
   const [segments, setSegments] = useState<Segment[]>([]);
   const [showLegacy, setShowLegacy] = useState(false);
   const [ingesting, setIngesting] = useState(false);
+  const [pendingNew, setPendingNew] = useState(0);
+  const headRef = useRef<DbHead | null>(null);
+  const tickBusy = useRef(false);
+  const listRef = useRef<HTMLUListElement | null>(null);
 
   const loadCwds = async () => {
     try {
@@ -475,6 +485,103 @@ export default function App() {
   useEffect(() => {
     loadPrompts();
   }, [search, cwdFilter, onlyBookmarked, tagFilter, dateFrom, dateTo]);
+
+  // ─────────────────────── 목록 자동 갱신 (P1) ───────────────────────
+  //
+  // 3초마다 db_head() 만 본다 — 인덱스 SELECT 세 개, 쓰기 없음.
+  // 값이 바뀌었을 때만 실제 목록을 다시 읽는다.
+  //
+  // deps 를 [] 로 두는 게 중요하다. selected/editing 을 deps 에 넣으면 프롬프트를 클릭할
+  // 때마다 인터벌이 파괴·재생성되고 tick 이 즉시 재발화한다. 대신 ref 로 읽는다.
+  const loadPromptsRef = useRef<() => Promise<void>>(async () => {});
+  const loadSegmentsRef = useRef<(id: number) => Promise<void>>(async () => {});
+  const selectedRef = useRef<Prompt | null>(null);
+  const editingRef = useRef(false);
+  // deps 없이 매 렌더마다 최신 클로저를 ref 에 꽂는다. tick 은 이걸 읽으므로
+  // 상태가 바뀌어도 인터벌을 재생성할 필요가 없다.
+  useEffect(() => {
+    loadPromptsRef.current = loadPrompts;
+    loadSegmentsRef.current = loadSegments;
+    selectedRef.current = selected;
+    editingRef.current = responseEditing;
+  });
+
+  useEffect(() => {
+    let stopped = false;
+    let timer: number | undefined;
+    let ticks = 0;
+
+    const tick = async () => {
+      if (stopped) return;
+      // 창이 안 보이면 아무것도 하지 않는다.
+      if (!document.hidden && !tickBusy.current) {
+        tickBusy.current = true;
+        try {
+          const h = await invoke<DbHead>("db_head");
+          const prev = headRef.current;
+          headRef.current = h;
+
+          if (prev) {
+            if (h.max_prompt_id !== prev.max_prompt_id) {
+              // ⚠️ 스크롤된 목록 위에 행을 끼워 넣으면 모든 행이 밀리고, 사용자의 다음 클릭이
+              // 엉뚱한 프롬프트를 선택한다. WKWebView 에는 CSS scroll anchoring 이 없다.
+              // 대신 알림 필을 띄우고, 누를 때 맨 위로 올린다.
+              if ((listRef.current?.scrollTop ?? 0) > 8) {
+                setPendingNew(h.max_prompt_id - prev.max_prompt_id);
+              } else {
+                await loadPromptsRef.current();
+              }
+            }
+            // 응답이 새로 수집됐다면 열려 있는 프롬프트를 다시 그린다.
+            // **편집 중이면 건드리지 않는다** — 사용자가 쓰고 있는 것을 덮어쓰면 안 된다.
+            const sel = selectedRef.current;
+            if (sel && h.max_segment_id !== prev.max_segment_id && !editingRef.current) {
+              await loadSegmentsRef.current(sel.id);
+            }
+          }
+
+          // 15초마다 수집을 시도한다. 조건 없이 불러도 된다 — ingest_pending 은 세션 기록의
+          // mtime 이 자란 세션만 실제로 읽으므로, 아무것도 안 바뀌었으면 쿼리 몇 개로 끝난다.
+          // (진행 중인 턴은 파일이 계속 자라므로 응답이 실시간으로 채워진다.)
+          ticks += 1;
+          if (ticks % 5 === 0) {
+            await invoke("ingest_pending");
+          }
+        } catch {
+          // 폴링 실패가 앱을 죽이면 안 된다. 다음 tick 에 다시 시도한다.
+        } finally {
+          tickBusy.current = false;
+        }
+      }
+      // setInterval 이 아니라 self-scheduling setTimeout — tick 이 3초보다 오래 걸려도
+      // 호출이 쌓이지 않는다.
+      timer = window.setTimeout(tick, 3000);
+    };
+
+    tick();
+
+    // alt-tab 으로 돌아오면 기다리지 않고 즉시 한 번.
+    const wake = () => {
+      if (!document.hidden && !tickBusy.current) {
+        window.clearTimeout(timer);
+        tick();
+      }
+    };
+    window.addEventListener("focus", wake);
+    document.addEventListener("visibilitychange", wake);
+    return () => {
+      stopped = true;
+      window.clearTimeout(timer);
+      window.removeEventListener("focus", wake);
+      document.removeEventListener("visibilitychange", wake);
+    };
+  }, []);
+
+  const showNewPrompts = async () => {
+    setPendingNew(0);
+    listRef.current?.scrollTo({ top: 0 });
+    await loadPrompts();
+  };
 
   const loadResponse = async (promptId: number, refresh = false) => {
     setResponseLoading(true);
@@ -1043,16 +1150,19 @@ export default function App() {
               {onlyBookmarked ? "★" : "☆"}
             </button>
           </div>
+          {/* 강등. 목록은 이제 3초마다 스스로 갱신되므로 누를 필요가 없다.
+              그래도 지우지는 않는다 — 자동화가 조용히 멈췄을 때의 탈출구다. */}
           <button
             onClick={refreshAll}
-            title="새로고침"
+            title="자동으로 갱신됩니다. 눌러서 즉시 갱신할 수도 있습니다."
             style={{
               padding: "8px 12px",
-              border: "1px solid #ddd",
+              border: "1px solid #eee",
               borderRadius: 6,
               background: "#fff",
               cursor: "pointer",
               fontSize: 14,
+              color: "#bbb",
             }}
           >
             ↻
@@ -1247,7 +1357,27 @@ export default function App() {
             {error}
           </div>
         )}
+        {/* 스크롤된 상태에서 새 프롬프트가 들어오면 목록을 밀지 않고 여기로 알린다. */}
+        {pendingNew > 0 && (
+          <button
+            onClick={showNewPrompts}
+            style={{
+              margin: "0 10px 8px",
+              padding: "6px 12px",
+              border: "1px solid #cfe0f5",
+              borderRadius: 999,
+              background: "#eef5fd",
+              color: "#2556a0",
+              fontSize: 12,
+              cursor: "pointer",
+              alignSelf: "center",
+            }}
+          >
+            새 프롬프트 {pendingNew}개 ↑
+          </button>
+        )}
         <ul
+          ref={listRef}
           style={{
             listStyle: "none",
             margin: 0,
