@@ -405,6 +405,11 @@ export default function App() {
   const [purgeDeleting, setPurgeDeleting] = useState(false);
   const [lastBackup, setLastBackup] = useState("");
   const [appVersion, setAppVersion] = useState("");
+  // 설치된 스위퍼 세트(sweep.sh · archive_transcripts.py · recall-ingest)의 버전.
+  // null = 딱지 없음(install.sh 미실행). undefined = 아직 안 읽음.
+  const [sweeperVersion, setSweeperVersion] = useState<string | null | undefined>(
+    undefined
+  );
   const [refetchAllLoading, setRefetchAllLoading] = useState(false);
   const [confirmRefetchAll, setConfirmRefetchAll] = useState(false);
   const [segments, setSegments] = useState<Segment[]>([]);
@@ -554,6 +559,10 @@ export default function App() {
     loadCwds();
     loadTags();
     getVersion().then(setAppVersion).catch(() => {});
+    // 설치된 스위퍼 세트의 버전. 앱 버전과 갈라지면 install.sh 를 다시 안 돌린 것이다.
+    invoke<string | null>("sweeper_version")
+      .then(setSweeperVersion)
+      .catch(() => setSweeperVersion(null));
   }, []);
 
   // 되돌릴 수 없는 작업의 확인 상태는 ESC 로도 빠져나올 수 있어야 한다.
@@ -1205,7 +1214,33 @@ export default function App() {
           }}
         >
           <span>Recall</span>
-          <span>{appVersion ? `v${appVersion}` : ""}</span>
+          {/* v0.9.5 (0.9.4) — 괄호는 **설치된** 스위퍼 세트의 버전이다. 갈라져 있으면
+              앱만 새로 깔고 install.sh 를 다시 돌리지 않았다는 뜻이다. 훅의 건강 검사는
+              스크립트의 내용 해시만 보므로 수집기 **바이너리**가 낡은 경우를 못 잡는다.
+              (앱 버전은 tauri.conf.json, 스위퍼 버전은 Cargo.toml 에서 온다 — 버전을 올릴
+               때 세 파일을 함께 올리지 않으면 여기서 가짜 불일치가 뜬다.) */}
+          <span>
+            {appVersion ? `v${appVersion}` : ""}
+            {appVersion && sweeperVersion !== undefined && (
+              <span
+                title={
+                  sweeperVersion === null
+                    ? "스위퍼가 설치되지 않았습니다 — 앱이 닫혀 있는 동안에는 응답이 수집되지 않습니다.\nbash hooks/install.sh 를 실행하세요."
+                    : sweeperVersion !== appVersion
+                      ? `설치된 스위퍼가 v${sweeperVersion} 로 낡았습니다.\n앱만 새로 설치하고 install.sh 를 다시 돌리지 않은 상태입니다.\nbash hooks/install.sh 를 다시 실행하세요.`
+                      : "스위퍼(앱이 닫혀 있을 때 응답을 수집한다)가 앱과 같은 버전입니다."
+                }
+                style={{
+                  marginLeft: 4,
+                  color: sweeperVersion === appVersion ? "#aaa" : "#c0392b",
+                  fontWeight: sweeperVersion === appVersion ? 400 : 600,
+                  cursor: "help",
+                }}
+              >
+                ({sweeperVersion ?? "미설치"})
+              </span>
+            )}
+          </span>
         </div>
       </aside>
 

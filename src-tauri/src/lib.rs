@@ -1620,6 +1620,30 @@ struct CaptureHealth {
     checked_at: Option<String>,
 }
 
+/// **설치된** 스위퍼 세트의 버전. 앱 버전이 아니라 `~/.claude/recall-bin/.version` 을 읽는다.
+///
+/// 그 파일은 `install.sh` 가 방금 복사한 수집기 바이너리에게 `--version` 을 물어 찍은 것이다
+/// (레포의 버전 문자열이 아니다 — 그랬다면 낡은 바이너리에 새 딱지가 붙을 수 있다).
+///
+/// 그래서 푸터의 `v0.9.5 (0.9.4)` 는 **"앱만 새로 깔고 install.sh 를 다시 안 돌렸다"** 를 뜻한다.
+/// 훅의 건강 검사는 `sweep.sh`·`archive_transcripts.py` 의 **내용 해시**만 비교하므로
+/// **바이너리가 낡은 경우를 못 잡는다** — 이 표시가 그 구멍을 메운다.
+///
+/// `None` = 딱지가 없다. install.sh 를 아직 안 돌렸거나, 이 기능 이전 버전으로 설치했다는 뜻.
+#[tauri::command]
+fn sweeper_version() -> Option<String> {
+    let mut p = dirs::home_dir()?;
+    p.push(".claude");
+    p.push("recall-bin");
+    p.push(".version");
+    let v = std::fs::read_to_string(p).ok()?;
+    let v = v.trim().to_string();
+    if v.is_empty() {
+        return None;
+    }
+    Some(v)
+}
+
 #[tauri::command]
 fn capture_health() -> Result<CaptureHealth, String> {
     let conn = open_conn()?;
@@ -1707,6 +1731,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             list_prompts,
             responded_ids,
+            sweeper_version,
             list_cwds,
             set_cwd_alias,
             get_response,

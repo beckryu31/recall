@@ -9,6 +9,14 @@
 //!  스위퍼가 있으면 훅이 사는 건 지연시간뿐이며, 391MB 를 몇 초에 훑는다.)
 
 fn main() {
+    // `install.sh` 가 **설치된 이 바이너리에게 직접** 버전을 묻는다. 레포의 버전 문자열을
+    // 그대로 딱지로 찍으면, 수집기를 다시 빌드하지 않은 채 install.sh 만 돌렸을 때
+    // **낡은 바이너리에 새 딱지**가 붙는다. 거짓말하는 표시는 없느니만 못하다.
+    if std::env::args().any(|a| a == "--version") {
+        println!("{}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
+
     match recall_lib::run_ingest() {
         Ok(s) => {
             println!(
