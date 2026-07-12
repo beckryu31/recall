@@ -22,6 +22,7 @@ DB 가 잠겨 있든 깨져 있든 프롬프트는 스풀에 남는다. 나중�
 프롬프트 기록기가 프롬프트 입력을 방해하는 건 어떤 이유로도 정당화되지 않는다.
 (이전 버전은 이걸 docstring 으로 약속만 하고 json.JSONDecodeError 만 잡았다.)
 """
+import hashlib
 import json
 import os
 import sqlite3
@@ -164,12 +165,16 @@ def health_warning(check_db=True):
     #   접근을 허용하지 않는다. 그래서 레포를 심링크할 수 없고 ~/.claude/recall-bin/ 으로
     #   **복사**해야 한다. 그런데 사본은 갈라진다 — 훅을 고쳐도 안 돌던 그 문제와 똑같다.
     #   여기서 감시해서, 갈라지면 Claude 가 말하게 한다.
+    #   mtime 이 아니라 **내용 해시**로 본다. mtime 으로 보면 `git checkout` 이나 `git pull` 만
+    #   해도 짖는데, 내용은 같다. 오탐이 잦은 알람은 곧 무시당하는 알람이다.
     try:
         repo = Path((BIN_DIR / ".repo").read_text().strip())
         for name in ("sweep.sh", "archive_transcripts.py"):
-            if (repo / "hooks" / name).stat().st_mtime > (BIN_DIR / name).stat().st_mtime + 1:
+            src = hashlib.sha256((repo / "hooks" / name).read_bytes()).digest()
+            dst = hashlib.sha256((BIN_DIR / name).read_bytes()).digest()
+            if src != dst:
                 problems.append(
-                    f"스위퍼 사본이 레포보다 오래됐습니다 ({name}) — bash hooks/install.sh 재실행"
+                    f"스위퍼 사본이 레포와 다릅니다 ({name}) — bash hooks/install.sh 재실행"
                 )
                 break
     except (OSError, ValueError):
