@@ -593,6 +593,7 @@ export default function App() {
   // 때마다 인터벌이 파괴·재생성되고 tick 이 즉시 재발화한다. 대신 ref 로 읽는다.
   const loadPromptsRef = useRef<() => Promise<void>>(async () => {});
   const loadSegmentsRef = useRef<(id: number) => Promise<void>>(async () => {});
+  const refreshFlagsRef = useRef<() => Promise<void>>(async () => {});
   const selectedRef = useRef<Prompt | null>(null);
   const editingRef = useRef(false);
   // deps 없이 매 렌더마다 최신 클로저를 ref 에 꽂는다. tick 은 이걸 읽으므로
@@ -600,6 +601,7 @@ export default function App() {
   useEffect(() => {
     loadPromptsRef.current = loadPrompts;
     loadSegmentsRef.current = loadSegments;
+    refreshFlagsRef.current = refreshResponseFlags;
     selectedRef.current = selected;
     editingRef.current = responseEditing;
   });
@@ -630,11 +632,17 @@ export default function App() {
                 await loadPromptsRef.current();
               }
             }
-            // 응답이 새로 수집됐다면 열려 있는 프롬프트를 다시 그린다.
-            // **편집 중이면 건드리지 않는다** — 사용자가 쓰고 있는 것을 덮어쓰면 안 된다.
-            const sel = selectedRef.current;
-            if (sel && h.max_segment_id !== prev.max_segment_id && !editingRef.current) {
-              await loadSegmentsRef.current(sel.id);
+            if (h.max_segment_id !== prev.max_segment_id) {
+              // 응답이 새로 수집됐다면 열려 있는 프롬프트를 다시 그린다.
+              // **편집 중이면 건드리지 않는다** — 사용자가 쓰고 있는 것을 덮어쓰면 안 된다.
+              const sel = selectedRef.current;
+              if (sel && !editingRef.current) {
+                await loadSegmentsRef.current(sel.id);
+              }
+              // 그리고 목록에도 알려야 한다. 예전에는 이 소식이 상세 패널에만 도착해서,
+              // 응답이 다 수집된 뒤에도 "응답 없음" 배지가 **다음 프롬프트를 보낼 때까지**
+              // 남아 있었다(목록은 max_prompt_id 가 변할 때만 다시 읽으므로).
+              await refreshFlagsRef.current();
             }
           }
 
@@ -714,6 +722,24 @@ export default function App() {
     setSelected((prev) =>
       prev && prev.id === promptId ? { ...prev, has_response: has } : prev
     );
+  };
+
+  // 목록 행이 들고 있는 has_response 는 응답이 수집돼도 그 사실을 모른 채 늙는다
+  // (수집은 turn_segments 에만 쓰고, 목록은 새 프롬프트가 생길 때만 다시 읽으므로).
+  // 아직 "응답 없음" 인 행만 다시 판정해서 **그 행만** 패치한다 — 행 집합을 갈아끼우지
+  // 않으므로 스크롤도, 선택도, 검색·필터도 흔들리지 않는다.
+  //
+  // 이미 true 인 행을 안 물어봐도 되는 이유: 세그먼트를 지우는 경로가 없어
+  // has_response 는 false → true 로만 움직인다(`responded_ids` 참조).
+  const refreshResponseFlags = async () => {
+    const stale = prompts.filter((p) => !p.has_response).map((p) => p.id);
+    if (stale.length === 0) return;
+    try {
+      const answered = await invoke<number[]>("responded_ids", { ids: stale });
+      for (const id of answered) markHasResponse(id, true);
+    } catch {
+      // 폴링 경로다. 실패해도 다음 tick 이 다시 시도한다.
+    }
   };
 
   const saveResponseToPrompt = async () => {
