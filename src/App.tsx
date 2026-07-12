@@ -51,6 +51,8 @@ type PurgeScan = {
   scanned: number;
   recovered: number;
   protected: number;
+  /// 세션 기록이 없어 판단 자체가 불가능했던 것. 삭제 후보가 아니다.
+  unknown: number;
   candidates: PurgeCandidate[];
 };
 
@@ -1567,12 +1569,20 @@ export default function App() {
             </div>
 
             <div style={{ fontSize: 13, color: "#555", lineHeight: 1.7 }}>
-              응답이 비어 있던 <b>{purgeScan.scanned}개</b>를 검사했습니다.
+              48시간이 지났고 응답이 비어 있던 <b>{purgeScan.scanned}개</b>를
+              검사했습니다.
               <br />
               그중 <b style={{ color: "#2556a0" }}>
                 {purgeScan.recovered}개
               </b>{" "}
               는 세션 기록에서 응답을 되살렸습니다.
+              {purgeScan.unknown > 0 && (
+                <>
+                  <br />
+                  세션 기록이 없어 <b>{purgeScan.unknown}개</b>는 판단할 수
+                  없었습니다 — <b>삭제 대상이 아닙니다.</b>
+                </>
+              )}
               {purgeScan.protected > 0 && (
                 <>
                   <br />
@@ -1596,8 +1606,9 @@ export default function App() {
             ) : (
               <>
                 <div style={{ fontSize: 13, color: "#a33" }}>
-                  아래 <b>{purgeScan.candidates.length}개</b>는 응답을 되살리지
-                  못했습니다. 삭제하면 되돌릴 수 없습니다.
+                  아래 <b>{purgeScan.candidates.length}개</b>는 세션 기록을 찾아
+                  확인했지만 그 턴에 응답이 없었습니다. 삭제하면 되돌릴 수
+                  없습니다.
                 </div>
                 <div
                   style={{

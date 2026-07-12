@@ -58,6 +58,9 @@ struct PurgeScan {
     scanned: i64,
     recovered: i64,
     protected: i64,
+    /// 세션 기록이 없거나 읽지 못해 판단이 불가능했던 프롬프트.
+    /// 절대 삭제 후보가 아니다. 증거의 부재는 부재의 증거가 아니다.
+    unknown: i64,
     candidates: Vec<PurgeCandidate>,
 }
 
@@ -81,6 +84,20 @@ fn open_conn() -> Result<Connection, String> {
     )
     .map_err(|e| format!("DB open failed ({}): {}", db_path().display(), e))?;
 
+    // 이 DB 에는 쓰는 프로세스가 둘이다: Claude Code 의 UserPromptSubmit 훅과 이 앱.
+    // 기본 busy_timeout 은 0 이라 경합하면 곧바로 "database is locked" 로 실패한다.
+    // 비대칭이 의도적이다 — 앱 쿼리가 실패하면 사용자가 다시 누르면 그만이지만,
+    // 훅이 실패하면 프롬프트 행이 유실되고 그건 디스크 어디에도 복구 소스가 없다.
+    // 그래서 훅 쪽은 더 길게(5초) 기다리고, 앱은 짧게(3초) 양보한다.
+    let _ = conn.busy_timeout(std::time::Duration::from_millis(3000));
+
+    ensure_aux_tables(&conn)?;
+    Ok(conn)
+}
+
+/// Recall 이 소유하는 부수 테이블들. `prompts` 는 log_prompt.py 가 만드는 외부 테이블이라
+/// 여기서 만들지 않는다.
+fn ensure_aux_tables(conn: &Connection) -> Result<(), String> {
     conn.execute(
         "CREATE TABLE IF NOT EXISTS cwd_aliases (
              cwd        TEXT PRIMARY KEY,
@@ -135,7 +152,7 @@ fn open_conn() -> Result<Connection, String> {
     // (log_prompt.py 가 만든 외부 테이블이라 여기서 방어적으로 추가; 이미 있으면 무시)
     let _ = conn.execute("ALTER TABLE prompts ADD COLUMN msg_uuid TEXT", []);
 
-    Ok(conn)
+    Ok(())
 }
 
 fn encode_cwd_to_folder(cwd: &str) -> String {
@@ -847,9 +864,14 @@ fn fetch_recent_responses() -> Result<BatchFetchResult, String> {
 /// 업그레이드 후 한 번 돌려 과거 기록까지 새 로직으로 맞추는 용도.
 ///
 /// 세션 파일을 프롬프트마다 다시 읽지 않고 세션당 한 번만 인덱싱한다.
+///
+/// 이 함수는 저장된 응답을 **대량으로 덮어쓴다.** 새 추출 결과가 저장된 바이트보다 낫다고
+/// 자동으로 판단하는 것이므로, 삭제와 같은 등급의 파괴적 작업이다.
+/// 그래서 delete_prompts 와 마찬가지로 **백업이 성공한 뒤에만** 진행한다.
 #[tauri::command]
 fn refetch_all_responses() -> Result<BatchFetchResult, String> {
     let conn = open_conn()?;
+    backup_db(&conn)?;
     let offset = local_offset_seconds(&conn);
 
     // (cwd, session_id) 로 묶어, 같은 transcript 를 쓰는 프롬프트를 한 번에 처리한다.
@@ -1002,23 +1024,56 @@ fn delete_prompt(id: i64) -> Result<(), String> {
     Ok(())
 }
 
+/// 자동 수집이 응답을 `turn_segments` 에 쓰기 시작하면 `prompts.response` 는 비어 있는 채로
+/// 남는다. 그때 "응답 없음 = 지울 것"이라는 옛 의미를 그대로 두면 **완벽하게 수집된 프롬프트가
+/// 전부 삭제 후보가 된다.** 테이블이 아직 없더라도 이 가드를 지금 넣어, 마이그레이션과 술어
+/// 수정이 어긋나는 창을 아예 만들지 않는다.
+fn has_segments_table(conn: &Connection) -> bool {
+    conn.query_row(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='turn_segments'",
+        [],
+        |_| Ok(()),
+    )
+    .optional()
+    .ok()
+    .flatten()
+    .is_some()
+}
+
 /// 응답이 비어 있는 프롬프트를 훑어 JSONL 에서 응답을 되살려 보고,
-/// 그래도 응답을 찾지 못한 것들만 삭제 후보로 돌려준다.
+/// **부재의 적극적 증거가 있는 것만** 삭제 후보로 돌려준다.
+///
+/// 삭제 후보가 되려면 세 가지가 모두 참이어야 한다:
+///   1. 세션 기록을 **찾았고**
+///   2. 그 기록 안에서 이 프롬프트의 턴에 응답이 **없음을 확인했고**
+///   3. 48시간이 지나 진행 중인 턴이 아님이 확실하다
+///
+/// 세션 기록이 없거나 읽지 못한 것은 `unknown` 이며 **절대 삭제 후보가 아니다.**
+/// 2026-04 에 438개가 삭제된 사고가 정확히 이 경로였다 — 복구 로직이 고장 나 있었고,
+/// 복구 실패가 곧 "지워도 되는 것"으로 해석됐다. 증거의 부재는 부재의 증거가 아니다.
+///
 /// 북마크나 태그가 달린 프롬프트는 사용자가 아끼는 것으로 보고 건드리지 않는다.
 #[tauri::command]
 fn scan_unanswered_prompts() -> Result<PurgeScan, String> {
     let conn = open_conn()?;
+    scan_unanswered(&conn)
+}
 
-    let unprotected = "(p.response IS NULL OR p.response = '')
-         AND NOT EXISTS (SELECT 1 FROM prompt_bookmarks b WHERE b.prompt_id = p.id)
-         AND NOT EXISTS (SELECT 1 FROM prompt_tags t WHERE t.prompt_id = p.id)";
+fn scan_unanswered(conn: &Connection) -> Result<PurgeScan, String> {
+    let no_response = if has_segments_table(conn) {
+        "(p.response IS NULL OR p.response = '')
+         AND NOT EXISTS (SELECT 1 FROM turn_segments s WHERE s.prompt_id = p.id)"
+    } else {
+        "(p.response IS NULL OR p.response = '')"
+    };
+    let loved = "(EXISTS (SELECT 1 FROM prompt_bookmarks b WHERE b.prompt_id = p.id)
+                  OR EXISTS (SELECT 1 FROM prompt_tags t WHERE t.prompt_id = p.id))";
+    // 진행 중인 턴을 삭제 후보로 집지 않는다. 응답은 턴이 끝나야 존재한다.
+    let settled = "datetime(p.created_at) < datetime('now', '-48 hours', 'localtime')";
 
     let protected: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM prompts p
-             WHERE (p.response IS NULL OR p.response = '')
-               AND (EXISTS (SELECT 1 FROM prompt_bookmarks b WHERE b.prompt_id = p.id)
-                 OR EXISTS (SELECT 1 FROM prompt_tags t WHERE t.prompt_id = p.id))",
+            &format!("SELECT COUNT(*) FROM prompts p WHERE {no_response} AND {loved}"),
             [],
             |row| row.get(0),
         )
@@ -1026,8 +1081,9 @@ fn scan_unanswered_prompts() -> Result<PurgeScan, String> {
 
     let ids: Vec<i64> = {
         let sql = format!(
-            "SELECT p.id FROM prompts p WHERE {} ORDER BY p.id DESC",
-            unprotected
+            "SELECT p.id FROM prompts p
+             WHERE {no_response} AND NOT {loved} AND {settled}
+             ORDER BY p.id DESC"
         );
         let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
         let mapped = stmt
@@ -1039,12 +1095,22 @@ fn scan_unanswered_prompts() -> Result<PurgeScan, String> {
     };
 
     let mut recovered = 0;
+    let mut unknown = 0;
     let mut candidates = Vec::new();
     for id in &ids {
-        // 응답을 되살릴 수 있으면 살린다. 살아난 프롬프트는 삭제 후보가 아니다.
-        if let Ok(Some(_)) = fetch_response_from_jsonl_and_save(&conn, *id) {
-            recovered += 1;
-            continue;
+        match fetch_response_from_jsonl_and_save(conn, *id) {
+            // 세션 기록에서 응답을 되살렸다. 삭제 후보가 아니다.
+            Ok(Some(_)) => {
+                recovered += 1;
+                continue;
+            }
+            // 세션 기록은 찾았는데 이 턴에 응답이 없었다 — 부재의 적극적 증거.
+            Ok(None) => {}
+            // 세션 기록 자체가 없거나 읽지 못했다 — 판단 불가. 손대지 않는다.
+            Err(_) => {
+                unknown += 1;
+                continue;
+            }
         }
         let row = conn
             .query_row(
@@ -1067,6 +1133,7 @@ fn scan_unanswered_prompts() -> Result<PurgeScan, String> {
         scanned: ids.len() as i64,
         recovered,
         protected,
+        unknown,
         candidates,
     })
 }
@@ -1243,8 +1310,41 @@ fn toggle_bookmark(prompt_id: i64, bookmarked: bool) -> Result<bool, String> {
     Ok(bookmarked)
 }
 
+/// rollback journal 모드에서는 쓰기 하나가 DB 전체를 잠근다. 훅과 앱이 함께 쓰는 이 DB 에선
+/// 그게 곧 프롬프트 행 유실이다. WAL 은 읽기와 쓰기가 서로를 막지 않으므로 이 경합을 없앤다.
+///
+/// journal_mode 는 DB 헤더에 영속되는 값이라 한 번만 바꾸면 훅도 자동으로 혜택을 받는다.
+/// 되돌릴 수 없는 헤더 변경이므로 **스냅샷을 먼저 뜨고**, 전환 뒤 **반드시 읽어서 확인한다** —
+/// `PRAGMA journal_mode=WAL` 은 다른 연결이 락을 쥐고 있으면 실패를 알리지 않고
+/// 그냥 '현재 모드'를 돌려주기 때문이다.
+fn migrate_journal_mode() -> Result<String, String> {
+    let conn = open_conn()?;
+    let mode: String = conn
+        .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+        .map_err(|e| e.to_string())?;
+    if mode.eq_ignore_ascii_case("wal") {
+        return Ok(mode);
+    }
+
+    backup_db(&conn)?;
+
+    let got: String = conn
+        .query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))
+        .map_err(|e| e.to_string())?;
+    if !got.eq_ignore_ascii_case("wal") {
+        return Err(format!("WAL 전환이 적용되지 않음 (현재 모드: {got})"));
+    }
+    Ok(got)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // 실패해도 앱은 뜬다 — 예전과 똑같이 동작할 뿐이다. 조용히 넘기지는 않는다.
+    match migrate_journal_mode() {
+        Ok(mode) => eprintln!("[recall] journal_mode = {mode}"),
+        Err(e) => eprintln!("[recall] WAL 전환 실패, rollback journal 로 계속합니다: {e}"),
+    }
+
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_clipboard_manager::init())
@@ -1267,4 +1367,132 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 삭제 후보 판정만 검증한다. 이 프로젝트에는 CI 가 없고, 여기서 한 번 틀려서
+    /// 프롬프트 438개가 사라졌다. `cargo test` 로 못 박아 둔다.
+    fn test_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE prompts (
+                 id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                 session_id TEXT,
+                 cwd        TEXT,
+                 prompt     TEXT NOT NULL,
+                 created_at TEXT NOT NULL,
+                 response   TEXT,
+                 msg_uuid   TEXT
+             );",
+        )
+        .unwrap();
+        ensure_aux_tables(&conn).unwrap();
+        conn
+    }
+
+    /// created_at 을 리터럴로 박으면 시간이 흘러 '48시간 이전' 의 의미가 바뀐다.
+    /// 항상 지금 기준 상대 시각으로 만든다.
+    fn insert_prompt(conn: &Connection, session: Option<&str>, cwd: Option<&str>, age_hours: i64) -> i64 {
+        conn.execute(
+            "INSERT INTO prompts (session_id, cwd, prompt, created_at, response)
+             VALUES (?1, ?2, 'p', datetime('now', 'localtime', ?3), NULL)",
+            params![session, cwd, format!("-{} hours", age_hours)],
+        )
+        .unwrap();
+        conn.last_insert_rowid()
+    }
+
+    /// 세션 기록 파일이 없으면 '판단 불가' 다. 절대 삭제 후보가 될 수 없다.
+    /// 438개가 사라진 경로가 바로 이것이었다: 복구가 실패했다는 사실이
+    /// "지워도 되는 것" 의 근거로 쓰였다.
+    #[test]
+    fn missing_transcript_is_unknown_never_a_candidate() {
+        let conn = test_db();
+        insert_prompt(&conn, Some("no-such-session"), Some("/no/such/cwd"), 72);
+
+        let scan = scan_unanswered(&conn).unwrap();
+
+        assert_eq!(scan.unknown, 1, "세션 기록이 없으면 unknown 이어야 한다");
+        assert!(
+            scan.candidates.is_empty(),
+            "세션 기록을 못 찾은 프롬프트가 삭제 후보가 됐다 — 438 사고의 재발"
+        );
+    }
+
+    /// session_id / cwd 가 아예 없는 행도 마찬가지로 판단 불가다.
+    #[test]
+    fn prompt_without_session_is_unknown_never_a_candidate() {
+        let conn = test_db();
+        insert_prompt(&conn, None, None, 72);
+
+        let scan = scan_unanswered(&conn).unwrap();
+
+        assert_eq!(scan.unknown, 1);
+        assert!(scan.candidates.is_empty());
+    }
+
+    /// 진행 중일 수 있는 최근 턴은 아예 검사 대상이 아니다.
+    /// 응답은 턴이 끝나야 존재하므로, "지금 응답이 없다" 는 아무 의미가 없다.
+    #[test]
+    fn recent_prompt_is_not_scanned() {
+        let conn = test_db();
+        insert_prompt(&conn, Some("s"), Some("/c"), 1);
+
+        let scan = scan_unanswered(&conn).unwrap();
+
+        assert_eq!(scan.scanned, 0, "48시간 안쪽 프롬프트를 검사했다");
+        assert!(scan.candidates.is_empty());
+    }
+
+    /// Stage 2 대비. 자동 수집이 turn_segments 에 쓰기 시작하면 prompts.response 는
+    /// 비어 있는 채로 남는다. 그때 "응답 없음 = 지울 것" 이라는 옛 의미를 그대로 두면
+    /// **완벽하게 수집된 프롬프트가 전부 삭제 후보가 된다.**
+    #[test]
+    fn prompt_with_segments_is_never_a_candidate() {
+        let conn = test_db();
+        conn.execute_batch(
+            "CREATE TABLE turn_segments (
+                 id        INTEGER PRIMARY KEY,
+                 prompt_id INTEGER NOT NULL,
+                 kind      TEXT NOT NULL
+             );",
+        )
+        .unwrap();
+        let id = insert_prompt(&conn, Some("no-such-session"), Some("/no/such/cwd"), 72);
+        conn.execute(
+            "INSERT INTO turn_segments (prompt_id, kind) VALUES (?1, 'text')",
+            params![id],
+        )
+        .unwrap();
+
+        let scan = scan_unanswered(&conn).unwrap();
+
+        assert_eq!(
+            scan.scanned, 0,
+            "세그먼트로 수집이 끝난 프롬프트를 '응답 없음' 으로 봤다"
+        );
+        assert!(scan.candidates.is_empty());
+        assert_eq!(scan.unknown, 0);
+    }
+
+    /// 북마크가 달린 프롬프트는 검사조차 하지 않는다.
+    #[test]
+    fn bookmarked_prompt_is_protected() {
+        let conn = test_db();
+        let id = insert_prompt(&conn, Some("no-such-session"), Some("/no/such/cwd"), 72);
+        conn.execute(
+            "INSERT INTO prompt_bookmarks (prompt_id) VALUES (?1)",
+            params![id],
+        )
+        .unwrap();
+
+        let scan = scan_unanswered(&conn).unwrap();
+
+        assert_eq!(scan.protected, 1);
+        assert_eq!(scan.scanned, 0);
+        assert!(scan.candidates.is_empty());
+    }
 }
