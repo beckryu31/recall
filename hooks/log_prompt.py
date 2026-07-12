@@ -44,6 +44,31 @@ BIN_DIR = HOME / ".claude" / "recall-bin"
 BUSY_TIMEOUT_SEC = 5.0
 
 
+def prompt_text(raw):
+    """payload 에서 프롬프트 본문을 꺼낸다. **꺼낼 수 없으면 None(= 판단 불가).**
+
+    `""` 와 `None` 의 차이가 이 함수의 전부다:
+
+    - `""` — 본문이 **없다**고 단정할 수 있다. 버려도 된다.
+    - `None` — 모양을 모르겠다. **버리면 안 된다.** 평소대로 스풀에 남겨 사람이 보게 한다.
+
+    파싱 못 한 payload 를 "빈 프롬프트" 로 단정하는 것이야말로 프롬프트를 잃는 길이다.
+    프롬프트 438개가 사라진 사고가 정확히 그 형태였다 — **복구 실패가 삭제의 근거로 쓰였다.**
+    """
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    p = data.get("prompt")
+    if p is None:
+        return ""  # 키가 없다 = 본문이 없다
+    if not isinstance(p, str):
+        return None  # 모르는 모양 → 판단하지 않는다
+    return p
+
+
 def write_spool(raw: str):
     """DB 를 건드리기 전에 payload 원본을 남긴다. 실패해도 조용히 None."""
     try:
@@ -80,6 +105,21 @@ def drain_spool(conn, keep):
         except (OSError, json.JSONDecodeError):
             # 파싱 자체가 안 되는 파일은 지우지 않는다 — 사람이 볼 수 있게 남긴다.
             continue
+
+        # 빈 프롬프트는 기록하지 않는다 (main 의 ⓪ 과 같은 이유). 이 규칙 이전에 만들어진
+        # 스풀 파일이 남아 있을 수 있으므로 여기서도 막는다.
+        #
+        # 그리고 **지운다.** 안 지우면 영원히 드레인되지 않는 파일이 되어 검사 ①
+        # ("프롬프트 N개가 DB 에 기록되지 못하고 스풀에 남아 있습니다") 가 오탐으로
+        # 짖는다 — 그건 알람을 죽이는 가장 빠른 길이다. 버리는 것은 본문이 없는 껍데기뿐이다.
+        p = data.get("prompt")
+        if isinstance(p, str) and not p.strip():
+            try:
+                path.unlink()
+            except OSError:
+                pass
+            continue
+
         try:
             dup = conn.execute(
                 "SELECT 1 FROM prompts WHERE cc_turn_id IS ?1 AND prompt = ?2 LIMIT 1",
@@ -107,6 +147,44 @@ def drain_spool(conn, keep):
         except Exception:
             # 이번에도 실패하면 그대로 둔다. 다음 기회에 다시 시도한다.
             return
+
+
+# ── ⑥ "스위퍼는 돌았는데 아무것도 안 만들었다" 를 재는 술어 ───────────────────────
+#
+# 기존 정체 검사(⑤)는 `MAX(ingest_state.ingested_at)` 만 본다. 그런데 수집기는
+# **세그먼트를 0개 만들어도 도장을 찍는다** (`ingest.rs` 의 `ingest_sessions` 는 파일
+# mtime 만 보고 기록한다). 즉 ⑤ 는 **프로세스 생존**을 재면서 문구는 "응답을 수집하지
+# 못했습니다" 라고 **결과**를 주장한다. 파서가 조용히 죽으면 ⑤ 는 영원히 침묵한다 —
+# 하트비트는 "살아있음" 이지 "일했음" 이 아니다.
+#
+# 그래서 결과를 본다. 최근 프롬프트 10개(≥3시간 된 것)가 **전부**
+#   · kind 가 비어 있고 (수집이 손대면 'human' 또는 'system' 이 된다) — **그리고**
+#   · 그 세션이 그 프롬프트보다 **나중에** 수집됐다
+# 면, 수집기가 보고 지나갔는데 아무것도 못 만든 것이다.
+#
+# **접속사가 오탐을 죽인다.** "아직 안 돌았다"(도장이 프롬프트보다 이르다)로는 짖지
+# 않는다 — 노트북을 며칠 닫았다 열고 바로 프롬프트를 치는 시나리오가 그것이다.
+#
+# 함정 둘, 둘 다 조용하다:
+#   · `created_at` 은 로컬, `ingested_at` 은 UTC(`datetime('now')`) → 'localtime' 으로 맞춘다.
+#   · `created_at` 은 'T' 구분자("2026-07-12T18:11:38")인데 `datetime()` 은 공백을 돌려준다.
+#     감싸지 않고 문자열로 비교하면 'T'(0x54) > ' '(0x20) 이라 **같은 날짜가 통째로 미래로
+#     취급**되어, "3시간 전" 창이 조용히 "어제 이전" 으로 밀린다 → 양쪽 다 `datetime()` 으로 감싼다.
+BARREN_WINDOW = 10
+BARREN_MIN_AGE_HOURS = 3
+BARREN_SWEEP_SQL = f"""
+    SELECT COUNT(*),
+           SUM(CASE WHEN p.kind IS NULL
+                     AND s.ingested_at IS NOT NULL
+                     AND datetime(s.ingested_at, 'localtime') > datetime(p.created_at)
+                    THEN 1 ELSE 0 END)
+    FROM (SELECT id, session_id, created_at, kind
+          FROM prompts
+          WHERE datetime(created_at) <= datetime('now', 'localtime', '-{BARREN_MIN_AGE_HOURS} hours')
+          ORDER BY id DESC
+          LIMIT {BARREN_WINDOW}) p
+    LEFT JOIN ingest_state s ON s.session_id = p.session_id
+"""
 
 
 def health_warning(check_db=True):
@@ -180,14 +258,18 @@ def health_warning(check_db=True):
     except (OSError, ValueError):
         pass
 
-    # ④ 수집이 멈췄다. DB 를 열 수 있을 때만 본다.
+    # ⑤ 수집기가 아예 안 돈다 (**생존**을 잰다).
+    # ⑥ 수집기는 도는데 아무것도 만들지 못한다 (**결과**를 잰다).
+    #    DB 를 열 수 있을 때만 본다. 한 번의 연결로 둘 다 읽는다.
     if check_db:
         try:
             conn = sqlite3.connect(DB_PATH, timeout=2.0)
             try:
                 row = conn.execute("SELECT MAX(ingested_at) FROM ingest_state").fetchone()
+                barren = conn.execute(BARREN_SWEEP_SQL).fetchone()
             finally:
                 conn.close()
+
             if row and row[0]:
                 # ingested_at 은 datetime('now') = UTC. utcnow() 는 3.12+ 에서 deprecated 라
                 # stderr 경고가 사용자 화면에 뜰 수 있다. timezone-aware 로 계산한다.
@@ -195,6 +277,15 @@ def health_warning(check_db=True):
                 days = (datetime.now(timezone.utc) - last).days
                 if days >= 3:
                     problems.append(f"Recall 이 {days}일째 응답을 수집하지 못했습니다")
+
+            # ⑤ 와 겹치지 않는다: 수집기가 아예 안 돌면 ⑥ 의 접속사("프롬프트보다 나중에
+            # 수집됨")가 거짓이 되어 ⑥ 은 침묵한다. 두 알람이 동시에 짖는 일은 없다.
+            # 창이 다 차지 않았으면(프롬프트가 10개 미만) 판단하지 않는다 — 증거 부족이다.
+            if barren and barren[0] == BARREN_WINDOW and barren[1] == BARREN_WINDOW:
+                problems.append(
+                    f"Recall 수집기는 돌고 있지만 최근 프롬프트 {BARREN_WINDOW}개에서 "
+                    "응답을 하나도 만들지 못했습니다 (파서가 고장났을 수 있습니다)"
+                )
         except Exception:
             pass
 
@@ -297,6 +388,19 @@ def init_db(conn):
 
 def main():
     raw = sys.stdin.read()
+
+    # ⓪ 빈 프롬프트는 기록하지 않는다.
+    #
+    #   훅은 프롬프트의 **유일한 기록자**라서 "무엇이든 일단 적는다" 로 만들어져 있다.
+    #   그런데 payload 에 본문이 없으면 session_id 도 cwd 도 없는 **껍데기 행**이 생긴다.
+    #   그 행은 목록에 영원히 `응답 없음` 으로 남고, 자동 purge 로도 지워지지 않는다
+    #   (purge 는 세션 기록을 확인해야 하는데 세션이 없으므로 '판단 불가' → 후보에서 빠진다).
+    #
+    #   **판단할 수 있을 때만 버린다** — `prompt_text` 가 None 을 주면(파싱 불가·모르는 모양)
+    #   여기서 걸러내지 않고 평소대로 스풀에 남긴다.
+    text = prompt_text(raw)
+    if text is not None and not text.strip():
+        return
 
     # ① 무엇보다 먼저 원본을 남긴다.
     spool_path = write_spool(raw)
