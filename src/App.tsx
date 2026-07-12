@@ -71,6 +71,12 @@ type Segment = {
 const PROSE_MAX_LINES = 800;
 const PROSE_MAX_BYTES = 32_000;
 
+type CaptureHealth = {
+  /// 비었으면 정상. 판정은 훅(hooks/log_prompt.py)이 하고 앱은 읽기만 한다.
+  problems: string;
+  checked_at: string | null;
+};
+
 type DbHead = {
   max_prompt_id: number;
   max_segment_id: number;
@@ -331,6 +337,7 @@ export default function App() {
   const [showLegacy, setShowLegacy] = useState(false);
   const [ingesting, setIngesting] = useState(false);
   const [pendingNew, setPendingNew] = useState(0);
+  const [health, setHealth] = useState<CaptureHealth | null>(null);
   const headRef = useRef<DbHead | null>(null);
   const tickBusy = useRef(false);
   const listRef = useRef<HTMLUListElement | null>(null);
@@ -546,6 +553,10 @@ export default function App() {
           ticks += 1;
           if (ticks % 5 === 0) {
             await invoke("ingest_pending");
+          }
+          // 수집 상태. 훅이 매 프롬프트마다 계산해 DB 에 써 둔 것을 읽기만 한다.
+          if (ticks % 10 === 1) {
+            setHealth(await invoke<CaptureHealth>("capture_health"));
           }
         } catch {
           // 폴링 실패가 앱을 죽이면 안 된다. 다음 tick 에 다시 시도한다.
@@ -1884,6 +1895,31 @@ export default function App() {
         )}
       </main>
 
+      {/* 수집 상태 경고. 닫기 버튼이 없다 — 이건 스쳐도 되는 토스트가 아니라
+          "데이터가 지금 조용히 사라지고 있다" 는 신호다. 고쳐야 없어진다.
+          같은 경고가 UserPromptSubmit 훅의 stdout 으로도 나가서, 앱을 안 열어도
+          Claude 가 직접 알려준다 — 아무도 열 필요 없다고 설계한 GUI 뒤에
+          유일한 알람을 두지 않는다. */}
+      {health?.problems && (
+        <div
+          style={{
+            position: "fixed",
+            top: 0,
+            left: 0,
+            right: 0,
+            zIndex: 200,
+            background: "#fdf0f0",
+            borderBottom: "1px solid #e8c4c4",
+            padding: "10px 16px",
+            fontSize: 12,
+            color: "#933",
+            lineHeight: 1.6,
+            whiteSpace: "pre-wrap",
+          }}
+        >
+          {health.problems}
+        </div>
+      )}
       {report && (
         <div
           style={{
