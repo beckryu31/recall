@@ -36,6 +36,7 @@ DB_PATH = HOME / ".claude" / "prompts.db"
 SPOOL_DIR = HOME / ".claude" / "recall-spool" / "prompts"
 MANIFEST = HOME / ".claude" / "recall-archive" / "manifest.json"
 STAMP = HOME / ".claude" / "recall-spool" / ".last-health-warn"
+BIN_DIR = HOME / ".claude" / "recall-bin"
 
 # DB 가 잠겨 있으면 기다린다. 앱 쪽(3초)보다 길게 잡은 것은 의도적이다 —
 # 앱 쿼리가 실패하면 사용자가 다시 누르면 그만이지만, 훅이 실패하면 행이 사라진다.
@@ -155,6 +156,23 @@ def health_warning(check_db=True):
         if free_gb < 5:
             problems.append(f"디스크 여유가 {free_gb:.1f}GB 뿐입니다")
     except OSError:
+        pass
+
+    # ④ 스위퍼 사본이 레포보다 오래됐다.
+    #
+    #   스위퍼는 launchd 가 돌리는데, macOS TCC 는 launchd 에이전트에게 ~/Documents 등의
+    #   접근을 허용하지 않는다. 그래서 레포를 심링크할 수 없고 ~/.claude/recall-bin/ 으로
+    #   **복사**해야 한다. 그런데 사본은 갈라진다 — 훅을 고쳐도 안 돌던 그 문제와 똑같다.
+    #   여기서 감시해서, 갈라지면 Claude 가 말하게 한다.
+    try:
+        repo = Path((BIN_DIR / ".repo").read_text().strip())
+        for name in ("sweep.sh", "archive_transcripts.py"):
+            if (repo / "hooks" / name).stat().st_mtime > (BIN_DIR / name).stat().st_mtime + 1:
+                problems.append(
+                    f"스위퍼 사본이 레포보다 오래됐습니다 ({name}) — bash hooks/install.sh 재실행"
+                )
+                break
+    except (OSError, ValueError):
         pass
 
     # ④ 수집이 멈췄다. DB 를 열 수 있을 때만 본다.

@@ -603,10 +603,16 @@ fn list_prompts(
     }
 
     if let Some(q) = search.as_deref().filter(|s| !s.is_empty()) {
-        // 산문(narrative)까지 검색한다. 도구 덤프는 제외되므로 노이즈가 없다.
-        sql.push_str(" AND (p.prompt LIKE ? OR p.narrative LIKE ?)");
-        bind.push(Value::Text(format!("%{}%", q)));
-        bind.push(Value::Text(format!("%{}%", q)));
+        // 프롬프트 + 산문(narrative) + 레거시 response.
+        //
+        // response 도 봐야 한다: 세션 기록이 이미 삭제된 프롬프트(전체의 60% 남짓)에는
+        // narrative 가 없고 레거시 response 만 있다. 그걸 빼면 **검색이 아카이브의 절반을
+        // 못 본다.** 산문만 훑으면 도구 덤프 노이즈가 없다는 건 맞지만, 그건 세그먼트가
+        // 있는 행에만 해당하는 이야기다.
+        sql.push_str(" AND (p.prompt LIKE ? OR p.narrative LIKE ? OR p.response LIKE ?)");
+        for _ in 0..3 {
+            bind.push(Value::Text(format!("%{}%", q)));
+        }
     }
     if let Some(c) = cwd.as_deref() {
         if c == "__NULL__" {
@@ -1050,9 +1056,15 @@ fn drop_orphan_tags(conn: &Connection) -> Result<(), String> {
     Ok(())
 }
 
+/// 프롬프트 하나를 지운다. **되돌릴 수 없으므로 백업이 성공한 뒤에만 진행한다.**
+///
+/// 대량 삭제에만 백업을 붙이고 단일 삭제는 그냥 지우고 있었다. 그런데 프롬프트는
+/// 응답과 달리 **디스크의 어떤 것으로도 재생성할 수 없다** — 이 훅이 유일한 기록자다.
+/// 오클릭 한 번이 영구 소실이고, 휴지통도 없다. 128MB DB 스냅샷은 0.5초면 끝난다.
 #[tauri::command]
 fn delete_prompt(id: i64) -> Result<(), String> {
     let conn = open_conn()?;
+    backup_db(&conn)?;
     delete_prompt_row(&conn, id)?;
     drop_orphan_tags(&conn)?;
     Ok(())
@@ -1179,7 +1191,29 @@ fn backups_dir() -> PathBuf {
     p
 }
 
-/// 오래된 백업을 지우고 최근 KEEP 개만 남긴다.
+/// 우리가 만든 자동 스냅샷인가 — `prompts-YYYYmmdd-HHMMSS.db` 정확히 이 형태.
+///
+/// 예전 코드는 `*.db` 를 전부 모아 **이름순**으로 정렬하고 앞에서부터 지웠다. 그런데 사람이
+/// 손으로 만든 `prompts-pre-ingest-*.db` 같은 이름은 `prompts-2026…` **보다 뒤에** 정렬된다.
+/// 그래서 파일이 10개를 넘는 순간 **진짜 자동 스냅샷부터 지우고 손으로 만든 것만 남겼다.**
+/// 백업을 관리하는 코드가 백업을 죽이고 있었다.
+fn is_auto_backup(p: &Path) -> bool {
+    let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    let Some(rest) = name.strip_prefix("prompts-").and_then(|r| r.strip_suffix(".db")) else {
+        return false;
+    };
+    let b = rest.as_bytes(); // YYYYmmdd-HHMMSS
+    b.len() == 15
+        && b[8] == b'-'
+        && b.iter()
+            .enumerate()
+            .all(|(i, c)| i == 8 || c.is_ascii_digit())
+}
+
+/// 오래된 **자동** 백업을 지우고 최근 KEEP 개만 남긴다.
+/// 사람이 만든 백업은 개수에 세지도, 지우지도 않는다.
 fn prune_backups(keep: usize) {
     let Ok(entries) = std::fs::read_dir(backups_dir()) else {
         return;
@@ -1187,9 +1221,9 @@ fn prune_backups(keep: usize) {
     let mut files: Vec<PathBuf> = entries
         .flatten()
         .map(|e| e.path())
-        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("db"))
+        .filter(|p| is_auto_backup(p))
         .collect();
-    // 파일명이 prompts-YYYYmmdd-HHMMSS.db 라 이름순 = 시간순.
+    // 이름 형식을 검증했으므로 이름순 = 시간순이다.
     files.sort();
     if files.len() > keep {
         for old in &files[..files.len() - keep] {
