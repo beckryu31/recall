@@ -1,6 +1,6 @@
 [package]
 name = "recall"
-version = "0.9.1"
+version = "0.9.4"
 description = "Recall — a local-first desktop app for browsing your Claude Code prompt history"
 authors = ["beckryu"]
 license = "MIT"

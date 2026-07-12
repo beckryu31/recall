@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { getVersion } from "@tauri-apps/api/app";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
@@ -71,6 +71,11 @@ type Segment = {
 const PROSE_MAX_LINES = 800;
 const PROSE_MAX_BYTES = 32_000;
 
+// 검색 한 번은 prompt + narrative + response 세 컬럼(34MB)을 LIKE 로 훑는다 — 실측 82~95ms.
+// 사람이 타이핑을 멈춘 뒤에만 한 번 나가면 된다. 200ms 는 다음 타를 기다리기엔 충분히 길고,
+// 멈춘 뒤 기다림을 느끼기엔 충분히 짧다 (질의 자체가 ~90ms 이므로 체감 총합 ~290ms).
+const SEARCH_DEBOUNCE_MS = 200;
+
 type CaptureHealth = {
   /// 비었으면 정상. 판정은 훅(hooks/log_prompt.py)이 하고 앱은 읽기만 한다.
   problems: string;
@@ -100,7 +105,9 @@ type DeleteResult = {
 const sourceLabel = (s: PromptResponse["source"]) => {
   if (s === "saved") return "저장됨";
   if (s === "cache") return "캐시됨";
-  return "JSONL에서 가져옴";
+  // "jsonl" = 세션 기록에서 방금 읽었지만 **쓰지 않았다.** 이미 저장된 응답이 있어서다.
+  // 저장된 바이트를 이기는 자동 판단은 하지 않는다 — 커밋은 [저장] 으로 사람이 한다.
+  return "세션 기록에서 읽음 · 저장 안 됨";
 };
 
 /// 원형 되돌리기 화살표. 유니코드 ⟳ 는 폰트가 크기·두께를 정해버려 작게 나오므로 직접 그린다.
@@ -248,6 +255,70 @@ function FoldedSegment({
   );
 }
 
+/**
+ * 캡이 걸린 산문 렌더러. **레거시 `prompts.response` 를 그리는 모든 경로가 이걸 쓴다.**
+ *
+ * 세그먼트 경로에는 캡이 있었지만 레거시 경로에는 없었다. 그래서 프롬프트 5055 의
+ * 218KB 옛 추출본(개행 62,941개)이 `▸ 옛 추출본` 을 누르는 순간 앱을 1.1초 얼렸다 —
+ * 버그가 죽은 게 아니라 **클릭 한 번 뒤로 옮겨져 있었다.**
+ *
+ * `<pre>` 는 자식이 **텍스트 노드 하나**다. 220KB 든 2MB 든 DOM 노드 1개.
+ * react-markdown 은 같은 텍스트로 **hast 노드 94,000개**를 만든다.
+ * 브라우저를 얼리는 건 바이트가 아니라 **노드 수**다.
+ */
+function ProseView({ text }: { text: string }) {
+  const [forceMarkdown, setForceMarkdown] = useState(false);
+  const { nlines, nbytes } = useMemo(
+    () => ({
+      nlines: (text.match(/\n/g)?.length ?? 0) + 1,
+      // 세그먼트 쪽 캡(s.nbytes)과 **같은 축**으로 잰다. text.length 는 문자 수라
+      // 한글에서 바이트보다 훨씬 작게 나와 두 경로의 임계가 달라진다.
+      nbytes: new TextEncoder().encode(text).length,
+    }),
+    [text]
+  );
+
+  if ((nlines > PROSE_MAX_LINES || nbytes > PROSE_MAX_BYTES) && !forceMarkdown) {
+    return (
+      <div style={{ minWidth: 0 }}>
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: 8,
+            fontSize: 11,
+            color: "#a80",
+            marginBottom: 6,
+          }}
+        >
+          긴 텍스트 · {nlines.toLocaleString()}줄 · {humanBytes(nbytes)} (원문으로 표시)
+          <button
+            onClick={() => setForceMarkdown(true)}
+            title="노드 수가 많아 렌더링이 멈출 수 있습니다."
+            style={{
+              border: "1px solid #eecfa0",
+              background: "#fff",
+              color: "#a80",
+              borderRadius: 4,
+              cursor: "pointer",
+              fontSize: 11,
+              padding: "1px 6px",
+            }}
+          >
+            마크다운으로 렌더
+          </button>
+        </div>
+        <pre style={PRE}>{text}</pre>
+      </div>
+    );
+  }
+  return (
+    <div className="markdown-body" style={{ minWidth: 0 }}>
+      <ReactMarkdown remarkPlugins={[remarkGfm]}>{text}</ReactMarkdown>
+    </div>
+  );
+}
+
 /** 응답 하나 = 세그먼트 시퀀스. 이게 곧 "접어넣기" 의 결과물이다. */
 function SegmentView({ segments }: { segments: Segment[] }) {
   return (
@@ -308,7 +379,10 @@ export default function App() {
   const [prompts, setPrompts] = useState<Prompt[]>([]);
   const [selected, setSelected] = useState<Prompt | null>(null);
   const [draft, setDraft] = useState("");
-  const [search, setSearch] = useState("");
+  // 입력창에 보이는 값과 DB 에 나가는 값을 분리한다. 타이핑은 즉시 렌더되고, 질의만 디바운스된다.
+  const [search, setSearch] = useState(""); // 입력창이 보여주는 것
+  const [query, setQuery] = useState(""); // 실제로 DB 를 훑는 것
+  const [composing, setComposing] = useState(false); // IME 조합 중인가
   const [onlyBookmarked, setOnlyBookmarked] = useState(false);
   const [dateFrom, setDateFrom] = useState("");
   const [dateTo, setDateTo] = useState("");
@@ -334,6 +408,8 @@ export default function App() {
   const [refetchAllLoading, setRefetchAllLoading] = useState(false);
   const [confirmRefetchAll, setConfirmRefetchAll] = useState(false);
   const [segments, setSegments] = useState<Segment[]>([]);
+  // 수집된 응답의 산문 평탄화본. [복사] 가 집어가는 것 — 화면이 읽히는 그대로다.
+  const [narrative, setNarrative] = useState<string | null>(null);
   const [showLegacy, setShowLegacy] = useState(false);
   const [ingesting, setIngesting] = useState(false);
   const [pendingNew, setPendingNew] = useState(0);
@@ -371,9 +447,12 @@ export default function App() {
     try {
       const r = await invoke<BatchFetchResult>("fetch_recent_responses");
       showReport(
-        `최근 24시간 · 대상 ${r.total}개 중 ${r.fetched}개 응답을 가져왔습니다.` +
-          (r.not_found ? ` 응답을 찾지 못함 ${r.not_found}개.` : "") +
-          (r.failed ? ` 세션 기록이 없어 건너뜀 ${r.failed}개.` : "")
+        r.total === 0
+          ? "최근 24시간 안에 응답이 비어 있는 프롬프트가 없습니다."
+          : `최근 24시간 · 응답이 비어 있던 ${r.total}개 중 ${r.fetched}개를 채웠습니다. ` +
+              `이미 저장된 응답은 건드리지 않았습니다.` +
+              (r.not_found ? ` 응답을 찾지 못함 ${r.not_found}개.` : "") +
+              (r.failed ? ` 세션 기록이 없어 건너뜀 ${r.failed}개.` : "")
       );
       await loadPrompts();
       if (selected) await loadResponse(selected.id);
@@ -455,7 +534,7 @@ export default function App() {
       const rows = await invoke<Prompt[]>("list_prompts", {
         limit: 200,
         offset: 0,
-        search: search || null,
+        search: query || null,
         cwd: cwdArg,
         onlyBookmarked,
         tag: tagFilter || null,
@@ -489,9 +568,21 @@ export default function App() {
     return () => window.removeEventListener("keydown", onKey);
   }, [refetchAllLoading, purgeDeleting]);
 
+  // ─────────────────────── 검색 디바운스 + IME ───────────────────────
+  //
+  // 한글은 **조합 중 자모마다** onChange 가 발화한다. "세그먼트" 를 치면
+  // ㅅ·ㅔ·ㄱ·ㅡ·ㅁ·ㅓ·ㄴ·ㅌ·ㅡ 로 9번이다. 디바운스만 걸고 조합을 무시하면,
+  // 타이핑을 잠깐 멈춘 순간의 **미완성 자모("ㅅ")로 34MB 를 훑는다** — 비싸고, 결과도 틀리다.
+  // 그래서 조합 중에는 타이머조차 걸지 않는다. 조합이 끝나면 그때 디바운스가 시작된다.
+  useEffect(() => {
+    if (composing) return;
+    const t = setTimeout(() => setQuery(search), SEARCH_DEBOUNCE_MS);
+    return () => clearTimeout(t); // 다음 타가 오면 취소 — 마지막 것만 살아남는다
+  }, [search, composing]);
+
   useEffect(() => {
     loadPrompts();
-  }, [search, cwdFilter, onlyBookmarked, tagFilter, dateFrom, dateTo]);
+  }, [query, cwdFilter, onlyBookmarked, tagFilter, dateFrom, dateTo]);
 
   // ─────────────────────── 목록 자동 갱신 (P1) ───────────────────────
   //
@@ -643,9 +734,15 @@ export default function App() {
   // 세그먼트는 헤더만 가져온다. body 는 사용자가 펼칠 때 따로 — 그래서 2.5MB 응답도 즉시 뜬다.
   const loadSegments = async (promptId: number) => {
     try {
-      setSegments(await invoke<Segment[]>("list_segments", { promptId }));
+      const [segs, narr] = await Promise.all([
+        invoke<Segment[]>("list_segments", { promptId }),
+        invoke<string | null>("get_narrative", { promptId }),
+      ]);
+      setSegments(segs);
+      setNarrative(narr);
     } catch (e) {
       setSegments([]);
+      setNarrative(null);
       setError(String(e));
     }
   };
@@ -658,6 +755,7 @@ export default function App() {
     setResponseEditing(false);
     setConfirmingDelete(false);
     setSegments([]);
+    setNarrative(null);
     setShowLegacy(false);
     loadResponse(p.id);
     loadSegments(p.id);
@@ -699,10 +797,25 @@ export default function App() {
     if (selected) loadResponse(selected.id, true);
   };
 
+  // [복사] 는 **화면에 보이는 것**을 집어가야 한다.
+  //
+  // 세그먼트가 있으면 화면이 보여주는 건 세그먼트인데, 복사 버튼은 옛 `prompts.response` 를
+  // 집어가고 있었다. 그 둘을 다 가진 1,665행에서 **조용히 틀린 것을 클립보드에 넣었다.**
+  // 프롬프트 5497 이 최악이다 — 237바이트 스텁이 있어서 버튼이 **활성**인 채로
+  // 205KB 대신 237바이트를 건넸다.
+  //
+  // narrative 를 집어가는 이유: 세그먼트를 전부 이어붙이면 도구 덤프까지 딸려와 최대 2.5MB 가
+  // 되는데, 화면에도 그건 접혀 있다. narrative 는 산문 + 도구 한 줄 요약 — 화면이 읽히는 그대로다.
+  const copyText = segments.length > 0 ? narrative ?? responseDraft : responseDraft;
+
   const copyResponse = async () => {
-    if (!responseDraft) return;
-    await writeText(responseDraft);
-    showToast("응답 복사됨");
+    if (!copyText) return;
+    await writeText(copyText);
+    showToast(
+      segments.length > 0 && narrative
+        ? `응답 복사됨 (수집본 ${humanBytes(new TextEncoder().encode(narrative).length)})`
+        : "응답 복사됨"
+    );
   };
 
   // 짧은 확인용. "저장됨" 같은 스쳐도 되는 메시지에만 쓴다.
@@ -1106,6 +1219,13 @@ export default function App() {
               placeholder="검색..."
               value={search}
               onChange={(e) => setSearch(e.target.value)}
+              onCompositionStart={() => setComposing(true)}
+              // WebKit 은 compositionend 를 마지막 change 보다 **먼저** 낸다.
+              // 그래서 여기서 값을 직접 읽는다 — 이벤트 순서에 기대지 않는다.
+              onCompositionEnd={(e) => {
+                setSearch(e.currentTarget.value);
+                setComposing(false);
+              }}
               style={{
                 width: "100%",
                 padding: 10,
@@ -1118,7 +1238,12 @@ export default function App() {
             />
             {search && (
               <button
-                onClick={() => setSearch("")}
+                // 지우기는 디바운스를 건너뛴다. 사용자가 X 를 눌렀는데 200ms 뒤에
+                // 목록이 돌아오면 버튼이 씹힌 것처럼 느껴진다.
+                onClick={() => {
+                  setSearch("");
+                  setQuery("");
+                }}
                 title="검색어 지우기"
                 style={{
                   position: "absolute",
@@ -1181,7 +1306,7 @@ export default function App() {
           <button
             onClick={fetchRecentResponses}
             disabled={batchLoading}
-            title="최근 24시간 내 모든 프롬프트의 응답을 가져와 갱신"
+            title="최근 24시간 중 응답이 아직 비어 있는 프롬프트만 세션 기록에서 채웁니다. 이미 저장된 응답은 덮어쓰지 않습니다."
             style={{
               padding: "8px 10px",
               border: "1px solid #ddd",
@@ -1722,7 +1847,13 @@ export default function App() {
                     응답
                   </div>
                   {response && (
-                    <span style={{ fontSize: 11, color: "#888" }}>
+                    <span
+                      style={{
+                        fontSize: 11,
+                        // 저장 안 된 상태는 회색 속삭임으로 흘리면 안 된다. 오류는 아니므로 경보색도 아니다.
+                        color: response.source === "jsonl" ? "#b26a00" : "#888",
+                      }}
+                    >
                       ({sourceLabel(response.source)}) · {response.fetched_at}
                     </span>
                   )}
@@ -1830,28 +1961,24 @@ export default function App() {
                               {humanBytes(responseDraft.length)})
                             </button>
                             {showLegacy && (
-                              <div className="markdown-body" style={{ marginTop: 8, minWidth: 0 }}>
-                                <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                                  {responseDraft}
-                                </ReactMarkdown>
+                              <div style={{ marginTop: 8, minWidth: 0 }}>
+                                <ProseView text={responseDraft} />
                               </div>
                             )}
                           </div>
                         )}
                       </>
                     ) : responseDraft ? (
-                      <div className="markdown-body" style={{ minWidth: 0 }}>
-                        <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                          {responseDraft}
-                        </ReactMarkdown>
-                      </div>
+                      <ProseView text={responseDraft} />
                     ) : (
                       <div style={{ color: "#aaa" }}>(응답 없음)</div>
                     )}
                   </div>
                 )}
                 <div style={{ display: "flex", gap: 10, marginTop: 10 }}>
-                  <button onClick={copyResponse} disabled={!responseDraft}>
+                  {/* 세그먼트가 102개 떠 있는데 옛 response 가 비었다는 이유로 복사가 회색이던
+                      행이 18개 있었다. 복사할 게 있으면 누를 수 있어야 한다. */}
+                  <button onClick={copyResponse} disabled={!copyText}>
                     복사
                   </button>
                   <button
@@ -1863,6 +1990,7 @@ export default function App() {
                   <button
                     onClick={refreshResponse}
                     disabled={responseLoading}
+                    title="세션 기록에서 응답을 다시 읽어 보여줍니다. 이미 저장된 응답이 있으면 덮어쓰지 않고 화면에만 띄우므로, 마음에 들면 [저장] 을 누르세요. 프롬프트를 다시 클릭하면 저장된 응답으로 되돌아갑니다."
                     style={{ marginLeft: "auto" }}
                   >
                     ↻ 다시 가져오기
