@@ -109,6 +109,44 @@ def drain_spool(conn, keep):
             return
 
 
+# ── ⑥ "스위퍼는 돌았는데 아무것도 안 만들었다" 를 재는 술어 ───────────────────────
+#
+# 기존 정체 검사(⑤)는 `MAX(ingest_state.ingested_at)` 만 본다. 그런데 수집기는
+# **세그먼트를 0개 만들어도 도장을 찍는다** (`ingest.rs` 의 `ingest_sessions` 는 파일
+# mtime 만 보고 기록한다). 즉 ⑤ 는 **프로세스 생존**을 재면서 문구는 "응답을 수집하지
+# 못했습니다" 라고 **결과**를 주장한다. 파서가 조용히 죽으면 ⑤ 는 영원히 침묵한다 —
+# 하트비트는 "살아있음" 이지 "일했음" 이 아니다.
+#
+# 그래서 결과를 본다. 최근 프롬프트 10개(≥3시간 된 것)가 **전부**
+#   · kind 가 비어 있고 (수집이 손대면 'human' 또는 'system' 이 된다) — **그리고**
+#   · 그 세션이 그 프롬프트보다 **나중에** 수집됐다
+# 면, 수집기가 보고 지나갔는데 아무것도 못 만든 것이다.
+#
+# **접속사가 오탐을 죽인다.** "아직 안 돌았다"(도장이 프롬프트보다 이르다)로는 짖지
+# 않는다 — 노트북을 며칠 닫았다 열고 바로 프롬프트를 치는 시나리오가 그것이다.
+#
+# 함정 둘, 둘 다 조용하다:
+#   · `created_at` 은 로컬, `ingested_at` 은 UTC(`datetime('now')`) → 'localtime' 으로 맞춘다.
+#   · `created_at` 은 'T' 구분자("2026-07-12T18:11:38")인데 `datetime()` 은 공백을 돌려준다.
+#     감싸지 않고 문자열로 비교하면 'T'(0x54) > ' '(0x20) 이라 **같은 날짜가 통째로 미래로
+#     취급**되어, "3시간 전" 창이 조용히 "어제 이전" 으로 밀린다 → 양쪽 다 `datetime()` 으로 감싼다.
+BARREN_WINDOW = 10
+BARREN_MIN_AGE_HOURS = 3
+BARREN_SWEEP_SQL = f"""
+    SELECT COUNT(*),
+           SUM(CASE WHEN p.kind IS NULL
+                     AND s.ingested_at IS NOT NULL
+                     AND datetime(s.ingested_at, 'localtime') > datetime(p.created_at)
+                    THEN 1 ELSE 0 END)
+    FROM (SELECT id, session_id, created_at, kind
+          FROM prompts
+          WHERE datetime(created_at) <= datetime('now', 'localtime', '-{BARREN_MIN_AGE_HOURS} hours')
+          ORDER BY id DESC
+          LIMIT {BARREN_WINDOW}) p
+    LEFT JOIN ingest_state s ON s.session_id = p.session_id
+"""
+
+
 def health_warning(check_db=True):
     """수집이 조용히 멈췄으면 경고 문자열을 돌려준다. 정상이면 None.
 
@@ -180,14 +218,18 @@ def health_warning(check_db=True):
     except (OSError, ValueError):
         pass
 
-    # ④ 수집이 멈췄다. DB 를 열 수 있을 때만 본다.
+    # ⑤ 수집기가 아예 안 돈다 (**생존**을 잰다).
+    # ⑥ 수집기는 도는데 아무것도 만들지 못한다 (**결과**를 잰다).
+    #    DB 를 열 수 있을 때만 본다. 한 번의 연결로 둘 다 읽는다.
     if check_db:
         try:
             conn = sqlite3.connect(DB_PATH, timeout=2.0)
             try:
                 row = conn.execute("SELECT MAX(ingested_at) FROM ingest_state").fetchone()
+                barren = conn.execute(BARREN_SWEEP_SQL).fetchone()
             finally:
                 conn.close()
+
             if row and row[0]:
                 # ingested_at 은 datetime('now') = UTC. utcnow() 는 3.12+ 에서 deprecated 라
                 # stderr 경고가 사용자 화면에 뜰 수 있다. timezone-aware 로 계산한다.
@@ -195,6 +237,15 @@ def health_warning(check_db=True):
                 days = (datetime.now(timezone.utc) - last).days
                 if days >= 3:
                     problems.append(f"Recall 이 {days}일째 응답을 수집하지 못했습니다")
+
+            # ⑤ 와 겹치지 않는다: 수집기가 아예 안 돌면 ⑥ 의 접속사("프롬프트보다 나중에
+            # 수집됨")가 거짓이 되어 ⑥ 은 침묵한다. 두 알람이 동시에 짖는 일은 없다.
+            # 창이 다 차지 않았으면(프롬프트가 10개 미만) 판단하지 않는다 — 증거 부족이다.
+            if barren and barren[0] == BARREN_WINDOW and barren[1] == BARREN_WINDOW:
+                problems.append(
+                    f"Recall 수집기는 돌고 있지만 최근 프롬프트 {BARREN_WINDOW}개에서 "
+                    "응답을 하나도 만들지 못했습니다 (파서가 고장났을 수 있습니다)"
+                )
         except Exception:
             pass
 
